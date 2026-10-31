@@ -499,6 +499,16 @@ Node helpers:
   `history_read_events` takes a continuation point. `history_update` checks the operation results.
 - `write_array_dimensions` writes a `UInt32[]`; `read_value_rank` returns a plain integer above four dimensions.
   `Node.add_reference` sends the target NodeClass.
+- `add_variable` and `add_property` without a datatype take the DataType registered for the value's class before the
+  standard type of the same name, so a custom structure called `Range` gets its own DataType, not `i=884`.
+- `read_raw_history` and `read_event_history` treat a result without HistoryData (as with `GoodNoData`) as no values
+  instead of raising `AttributeError`. `Node.history_read` takes any `HistoryReadDetails`.
+- `get_node_supertypes` and `is_subtype` stop at a cycle of HasSubtype references instead of recursing forever.
+- `add_variable_type` and `create_variable_type` take a `value`, the default Value of the type's instances.
+- The event of `CallbackService`, `subscribe_server_callback` and `unsubscribe_server_callback` is typed
+  `CallbackType` (any string still works with `CallbackService`). Removed, as unused: `CallbackSubscriberInterface`,
+  `CallbackService.addSubscriber` and `call_listener`, `SocketClosedException`, `ua_utils.get_default_value` (use
+  `ua.get_default_value`) and `Node.__ne__`, which Python derives from `__eq__`.
 - A failed method call raises `UaStatusCodeError` with `input_argument_results` and `input_argument_diagnostic_infos`;
   multi-dimensional arguments are converted.
 - `create_method` takes `(nodeid, bname, callback, inputs, outputs)`; binding a callback on a client session raises

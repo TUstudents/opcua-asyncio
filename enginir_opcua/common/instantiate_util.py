@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Collection
-from typing import Any
 
 import enginir_opcua
 from enginir_opcua import ua
+from enginir_opcua.common.session_interface import AbstractSession
 
 from .copy_node_util import _added_node, _rdesc_from_node, _read_and_copy_attrs, remove_created
 from .node_factory import make_node
@@ -29,13 +29,13 @@ _BASE_TYPES = (
     ua.NodeId(ua.ObjectIds.BaseDataVariableType),
     ua.NodeId(ua.ObjectIds.PropertyType),
 )
-# A Method InstanceDeclaration can be instantiated too: the instance gets a copy of it with its arguments.
 _INSTANTIABLE = (ua.NodeClass.ObjectType, ua.NodeClass.VariableType, ua.NodeClass.Method)
 
 
 async def is_abstract(node_type: enginir_opcua.Node) -> bool:
+    """The IsAbstract attribute of a type node."""
     result = await node_type.read_attribute(ua.AttributeIds.IsAbstract)
-    return result.Value.Value  # type: ignore[union-attr]
+    return bool(result.Value.Value) if result.Value is not None else False
 
 
 async def instantiate(
@@ -49,10 +49,12 @@ async def instantiate(
     optional: Collection[str] | None = None,
 ) -> list[enginir_opcua.Node]:
     """
-    Instantiate an ObjectType or VariableType below a parent node. The new node, listed first in the result,
-    gets the children its type and the supertypes declare with the ModellingRules Mandatory (and Optional
-    if instantiate_optional). With optional, the Optional children named there are created even when
-    instantiate_optional is False; a name is the BrowseName path below the new node, joined by "/". Placeholders are not instantiated. If a step fails the nodes made so far are removed.
+    Instantiate an ObjectType or VariableType below a parent node; a Method InstanceDeclaration can be given too,
+    and the copy gets its arguments. The new node, listed first in the result, gets the children its type and the
+    supertypes declare with the ModellingRules Mandatory (and Optional if instantiate_optional). With optional, the
+    Optional children named there are created even when instantiate_optional is False; a name is the BrowseName
+    path below the new node, joined by "/". Placeholders are not instantiated. If a step fails the nodes made so
+    far are removed. nodeid defaults to a NodeId the server picks in namespace idx; bname to the type's BrowseName.
     """
     rdesc = await _rdesc_from_node(parent, node_type)
     rdesc.TypeDefinition = node_type.nodeid
@@ -63,9 +65,11 @@ async def instantiate(
     if nodeid is None:
         nodeid = ua.NodeId(NamespaceIndex=idx)
     if bname is None:
-        bname = rdesc.BrowseName
+        qname = rdesc.BrowseName
     elif isinstance(bname, str):
-        bname = ua.QualifiedName.from_string(bname)
+        qname = ua.QualifiedName.from_string(bname)
+    else:
+        qname = bname
 
     created: list[ua.NodeId] = []
     try:
@@ -75,7 +79,7 @@ async def instantiate(
             parent.nodeid,
             rdesc,
             nodeid,
-            bname,
+            qname,
             created,
             dname=dname,
             instantiate_optional=instantiate_optional,
@@ -87,7 +91,7 @@ async def instantiate(
     return [make_node(parent.session, nid) for nid in created]
 
 
-async def _modelling_rule(session: Any, declaration: enginir_opcua.Node, name: ua.QualifiedName) -> ua.NodeId | None:
+async def _modelling_rule(declaration: enginir_opcua.Node, name: ua.QualifiedName) -> ua.NodeId | None:
     rules = await declaration.get_referenced_nodes(ua.ObjectIds.HasModellingRule, ua.BrowseDirection.Forward)
     if not rules:
         return None
@@ -112,7 +116,7 @@ async def _declaration_sources(
 
 
 async def _instantiate_node(
-    session: Any,
+    session: AbstractSession,
     node_type: enginir_opcua.Node,
     parentid: ua.NodeId,
     rdesc: ua.ReferenceDescription,
@@ -158,17 +162,17 @@ async def _instantiate_node(
             if (c_rdesc.BrowseName.NamespaceIndex, c_rdesc.BrowseName.Name) in names:
                 continue
             c_node = make_node(session, c_rdesc.NodeId)
-            rule = await _modelling_rule(session, c_node, c_rdesc.BrowseName)
+            rule = await _modelling_rule(c_node, c_rdesc.BrowseName)
             if rule is None:
                 _logger.info("Instantiate: skip %s without modelling rule", c_rdesc.BrowseName)
                 continue
             if rule in _PLACEHOLDERS or rule == _EXPOSES_ITS_ARRAY:
                 _logger.info("Instantiate: skip %s with modelling rule %s", c_rdesc.BrowseName, rule)
                 continue
+            child_path = f"{path}/{c_rdesc.BrowseName.Name}" if path else str(c_rdesc.BrowseName.Name)
             if rule != _MANDATORY:
                 if rule != _OPTIONAL:
                     _logger.info("Instantiate: treating the rule %s of %s as Optional", rule, c_rdesc.BrowseName)
-                child_path = f"{path}/{c_rdesc.BrowseName.Name}" if path else str(c_rdesc.BrowseName.Name)
                 if not instantiate_optional and child_path not in optional:
                     continue
             if added.NodeIdType is ua.NodeIdType.String:
@@ -187,5 +191,5 @@ async def _instantiate_node(
                 is_declaration=True,
                 instantiate_optional=instantiate_optional,
                 optional=optional,
-                path=f"{path}/{c_rdesc.BrowseName.Name}" if path else str(c_rdesc.BrowseName.Name),
+                path=child_path,
             )

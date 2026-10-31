@@ -1,5 +1,10 @@
 """
-High level functions to create nodes
+Adding and deleting nodes with the NodeManagement services (OPC 10000-4 v1.05, 5.8).
+
+The create_ functions take the new node's NodeId and BrowseName in one of two forms: a NodeId (or its text form)
+and a QualifiedName (or its "ns:Name" text form), or a namespace index and a plain name, for which the server picks
+the NodeId. The new node gets the parent through the reference the NodeClass needs (Organizes below a folder,
+HasComponent, HasProperty or HasSubtype).
 """
 
 from __future__ import annotations
@@ -21,42 +26,29 @@ from .node_factory import make_node
 _logger = logging.getLogger(__name__)
 
 
-def _parse_nodeid_qname(*args: Any) -> tuple[ua.NodeId, ua.QualifiedName]:
-    try:
-        if isinstance(args[0], int):
-            nodeid = ua.NodeId(0, int(args[0]))
-            qname = ua.QualifiedName(args[1], int(args[0]))
-            return nodeid, qname
-        if isinstance(args[0], ua.NodeId):
-            nodeid = args[0]
-        elif isinstance(args[0], str):
-            nodeid = ua.NodeId.from_string(args[0])
-        else:
-            raise RuntimeError()
-        if isinstance(args[1], ua.QualifiedName):
-            qname = args[1]
-        elif isinstance(args[1], str):
-            qname = ua.QualifiedName.from_string(args[1])
-        else:
-            raise RuntimeError()
-        return nodeid, qname
-    except ua.UaError:
-        raise
-    except Exception as ex:
-        raise TypeError(
-            f"This method takes either a namespace index and a string as argument or a nodeid and a qualifiedname."
-            f" Received arguments {args} and got exception {ex}"
-        )
+def _parse_nodeid_qname(
+    nodeid: ua.NodeId | str | int, bname: ua.QualifiedName | str
+) -> tuple[ua.NodeId, ua.QualifiedName]:
+    usage = "Give a namespace index and a name, or a NodeId and a QualifiedName"
+    if isinstance(nodeid, int):
+        if not isinstance(bname, str):
+            raise TypeError(f"{usage}; got {nodeid!r} and {bname!r}")
+        return ua.NodeId(0, nodeid), ua.QualifiedName(bname, nodeid)
+    if isinstance(nodeid, str):
+        nodeid = ua.NodeId.from_string(nodeid)
+    elif not isinstance(nodeid, ua.NodeId):
+        raise TypeError(f"{usage}; got {nodeid!r}")
+    if isinstance(bname, str):
+        return nodeid, ua.QualifiedName.from_string(bname)
+    if not isinstance(bname, ua.QualifiedName):
+        raise TypeError(f"{usage}; got {bname!r}")
+    return nodeid, bname
 
 
 async def create_folder(
     parent: enginir_opcua.Node, nodeid: ua.NodeId | str | int, bname: ua.QualifiedName | str
 ) -> enginir_opcua.Node:
-    """
-    create a child node folder
-    arguments are nodeid, browsename
-    or namespace index, name
-    """
+    """Add a FolderType Object below parent."""
     nodeid, qname = _parse_nodeid_qname(nodeid, bname)
     return make_node(
         parent.session, await _create_object(parent.session, parent.nodeid, nodeid, qname, ua.ObjectIds.FolderType)
@@ -71,14 +63,14 @@ async def create_object(
     instantiate_optional: bool = True,
 ) -> enginir_opcua.Node:
     """
-    create a child node object
-    arguments are nodeid, browsename, [objecttype]
-    or namespace index, name, [objecttype]
-    if objectype is given (a NodeId) then the type node is instantiated inclusive its child nodes
+    Add an Object below parent. With objecttype the type is instantiated with its children (see
+    instantiate_util.instantiate), else the Object is a BaseObjectType.
     """
     nodeid, qname = _parse_nodeid_qname(nodeid, bname)
     if objecttype is not None:
-        objecttype_node = make_node(parent.session, objecttype)
+        objecttype_node = make_node(
+            parent.session, ua.NodeId(objecttype) if isinstance(objecttype, int) else objecttype
+        )
         dname = ua.LocalizedText(qname.Name)
         nodes = await instantiate(
             parent, objecttype_node, nodeid, bname=qname, dname=dname, instantiate_optional=instantiate_optional
@@ -98,17 +90,13 @@ async def create_property(
     varianttype: ua.VariantType | None = None,
     datatype: ua.NodeId | int | None = None,
 ) -> enginir_opcua.Node:
-    """
-    create a child node property
-    args are nodeid, browsename, value, [variant type]
-    or idx, name, value, [variant type]
-    """
+    """Add a PropertyType Variable below parent with HasProperty; see create_variable."""
     nodeid, qname = _parse_nodeid_qname(nodeid, bname)
-    var = ua.Variant(val, varianttype)
-    datatype = _checked_datatype(datatype, val)
+    var = ua.Variant(val) if varianttype is None else ua.Variant(val, varianttype)
+    checked = _checked_datatype(datatype, val)
     return make_node(
         parent.session,
-        await _create_variable(parent.session, parent.nodeid, nodeid, qname, var, datatype=datatype, isproperty=True),
+        await _create_variable(parent.session, parent.nodeid, nodeid, qname, var, datatype=checked, isproperty=True),
     )
 
 
@@ -121,16 +109,16 @@ async def create_variable(
     datatype: ua.NodeId | int | None = None,
 ) -> enginir_opcua.Node:
     """
-    create a child node variable
-    args are nodeid, browsename, value, [variant type], [data type]
-    or idx, name, value, [variant type], [data type]
+    Add a BaseDataVariableType Variable below parent with the value val, encoded as varianttype if given. The
+    DataType is datatype (a NodeId, or an integer of namespace 0), else that of the value's class: the registered
+    DataType of a structure or enumeration, the built-in type otherwise. The node is readable, not writable.
     """
     nodeid, qname = _parse_nodeid_qname(nodeid, bname)
-    var = ua.Variant(val, varianttype)
-    datatype = _checked_datatype(datatype, val)
+    var = ua.Variant(val) if varianttype is None else ua.Variant(val, varianttype)
+    checked = _checked_datatype(datatype, val)
     return make_node(
         parent.session,
-        await _create_variable(parent.session, parent.nodeid, nodeid, qname, var, datatype=datatype, isproperty=False),
+        await _create_variable(parent.session, parent.nodeid, nodeid, qname, var, datatype=checked, isproperty=False),
     )
 
 
@@ -153,33 +141,32 @@ async def create_variable_type(
     bname: ua.QualifiedName | str,
     datatype: ua.NodeId | int,
     is_abstract: bool = False,
+    value: Any = None,
 ) -> enginir_opcua.Node:
     """
-    Create a new variable type
-    args are nodeid, browsename and datatype
-    or idx, name and data type
+    Add a VariableType of the given DataType as subtype of parent; value, a Python value or a Variant, is the
+    default Value its instances start with, and an array value makes the type an array type.
     """
     nodeid, qname = _parse_nodeid_qname(nodeid, bname)
-    datatype = _checked_datatype(datatype, None)
-    if datatype is None:
+    checked = _checked_datatype(datatype, None)
+    if checked is None:
         raise TypeError("Data type argument must be a NodeId or an int referring to a NodeId")
     return make_node(
         parent.session,
-        await _create_variable_type(parent.session, parent.nodeid, nodeid, qname, datatype, is_abstract=is_abstract),
+        await _create_variable_type(parent.session, parent.nodeid, nodeid, qname, checked, value, is_abstract),
     )
 
 
 async def create_reference_type(
     parent: enginir_opcua.Node,
     nodeid: ua.NodeId | str | int,
-    bname: ua.QualifiedName | str | int,
+    bname: ua.QualifiedName | str,
     symmetric: bool = True,
     inversename: str | None = None,
 ) -> enginir_opcua.Node:
     """
-    Create a new reference type
-    args are nodeid and browsename
-    or idx and name
+    Add a concrete ReferenceType as subtype of parent. A symmetric one has no InverseName; a non-symmetric one
+    needs it (OPC 10000-3 v1.05, 5.3.3).
     """
     nodeid, qname = _parse_nodeid_qname(nodeid, bname)
     if symmetric and inversename:
@@ -198,11 +185,7 @@ async def create_object_type(
     bname: ua.QualifiedName | str,
     is_abstract: bool = False,
 ) -> enginir_opcua.Node:
-    """
-    Create a new object type to be instantiated in address space.
-    arguments are nodeid, browsename
-    or namespace index, name
-    """
+    """Add an ObjectType as subtype of parent."""
     nodeid, qname = _parse_nodeid_qname(nodeid, bname)
     return make_node(
         parent.session, await _create_object_type(parent.session, parent.nodeid, nodeid, qname, is_abstract)
@@ -218,16 +201,12 @@ async def create_method(
     outputs: list[Any] | None = None,
 ) -> enginir_opcua.Node:
     """
-    create a child method object
-    arguments are nodeid, browsename, callback, [input argument types], [output argument types]
-    or namespace index, name, callback, [input argument types], [output argument types]
-    if argument types are given, child nodes advertising what arguments the method uses and returns are created.
-    An argument type is a ua.Argument, a VariantType, a NodeId or a type class; a list of one of these declares an array.
-    A callback accepts the nodeid of the parent as first argument and variants after, and returns a list of variants.
-    A callback can only be bound on a local session (a Server); on any other session pass none and the
-    server that holds the node provides the implementation.
+    Add a Method below parent, with InputArguments and OutputArguments Properties for the argument types given.
+    An argument type is a ua.Argument, a VariantType, a NodeId, a Node or a class with a DataType; a list of one of
+    these declares an array. The callback gets the NodeId of the parent and the input Variants and returns a list of
+    Variants (methods.uamethod converts both). A callback can only be bound on a local session (a Server); on any
+    other session pass None and the server that holds the node provides the implementation.
     """
-    _logger.info("create_method %r", parent)
     nodeid, qname = _parse_nodeid_qname(nodeid, bname)
     if callback is not None and not hasattr(parent.session, "add_method_callback"):
         raise ua.UaError("A method callback can only be bound on a local server session")
@@ -345,7 +324,7 @@ async def _create_variable(
         attrs.DataType = _guess_datatype(var)
 
     attrs.Value = var
-    attrs.ValueRank, attrs.ArrayDimensions = _rank_and_dimensions(var)
+    attrs.ValueRank, attrs.ArrayDimensions = _rank_and_dimensions(var)  # type: ignore[assignment]
     attrs.WriteMask = 0
     attrs.UserWriteMask = 0
     attrs.Historizing = False
@@ -379,17 +358,16 @@ async def _create_variable_type(
     addnode.NodeClass = ua.NodeClass.VariableType
     addnode.ParentNodeId = parentnodeid
     addnode.ReferenceTypeId = ua.NodeId(ua.ObjectIds.HasSubtype)
-    # addnode.TypeDefinition = ua.NodeId(ua.ObjectIds.BaseDataVariableType)
     attrs = ua.VariableTypeAttributes()
     attrs.DisplayName = ua.LocalizedText(qname.Name)
     attrs.DataType = datatype
     attrs.IsAbstract = is_abstract
     attrs.ValueRank = ua.ValueRank.Scalar
-    attrs.ArrayDimensions = None
+    attrs.ArrayDimensions = None  # type: ignore[assignment]
     if value is not None:
         variant = value if isinstance(value, ua.Variant) else ua.Variant(value)
         attrs.Value = variant
-        attrs.ValueRank, attrs.ArrayDimensions = _rank_and_dimensions(variant)
+        attrs.ValueRank, attrs.ArrayDimensions = _rank_and_dimensions(variant)  # type: ignore[assignment]
     attrs.WriteMask = 0
     attrs.UserWriteMask = 0
     addnode.NodeAttributes = attrs
@@ -406,9 +384,8 @@ async def create_data_type(
     is_abstract: bool = False,
 ) -> enginir_opcua.Node:
     """
-    Create a new data type to be used in new variables, etc ..
-    arguments are nodeid, browsename
-    or namespace index, name
+    Add a DataType as subtype of parent. Its DataTypeDefinition is writable, so that new_struct and new_enum
+    (structures104) can set it.
     """
     nodeid, qname = _parse_nodeid_qname(nodeid, bname)
     addnode = ua.AddNodesItem()
@@ -417,7 +394,6 @@ async def create_data_type(
     addnode.NodeClass = ua.NodeClass.DataType
     addnode.ParentNodeId = parent.nodeid
     addnode.ReferenceTypeId = ua.NodeId(ua.ObjectIds.HasSubtype)
-    # addnode.TypeDefinition = ua.NodeId(ua.ObjectIds.BaseDataVariableType) # No type definition for types
     attrs = ua.DataTypeAttributes()
     if description is not None:
         attrs.Description = ua.LocalizedText(description)
@@ -428,20 +404,13 @@ async def create_data_type(
     addnode.NodeAttributes = attrs
     results = await parent.session.add_nodes([addnode])
     results[0].StatusCode.check()
-
-    new_node_id = results[0].AddedNodeId
-
-    return make_node(parent.session, new_node_id)
+    return make_node(parent.session, results[0].AddedNodeId)
 
 
 async def create_encoding(
     parent: enginir_opcua.Node, nodeid: ua.NodeId | str | int, bname: ua.QualifiedName | str
 ) -> enginir_opcua.Node:
-    """
-    Create a new encoding object to be instantiated in address space.
-    arguments are nodeid, browsename
-    or namespace index, name
-    """
+    """Add a DataTypeEncodingType Object to the DataType parent with HasEncoding; the BrowseName is in namespace 0."""
     nodeid, qname = _parse_nodeid_qname(nodeid, bname)
     if qname.NamespaceIndex != 0:
         raise ua.UaError("Encoding QualifiedName index must be 0")
@@ -476,7 +445,7 @@ async def _create_method(
     parent: enginir_opcua.Node,
     nodeid: ua.NodeId,
     qname: ua.QualifiedName,
-    callback: Any,
+    callback: Callable[..., Any] | None,
     inputs: list[Any],
     outputs: list[Any],
 ) -> ua.NodeId:
@@ -529,7 +498,7 @@ def _vtype_to_argument(vtype: Any, name: str = "") -> ua.Argument:
     arg = ua.Argument()
     arg.Name = name
     arg.ValueRank = ua.ValueRank.Scalar
-    arg.ArrayDimensions = None
+    arg.ArrayDimensions = None  # type: ignore[assignment]
     if isinstance(vtype, list | tuple) and len(vtype) > 0:
         vtype = vtype[0]
         arg.ValueRank = ua.ValueRank.OneDimension
@@ -545,7 +514,7 @@ def _vtype_to_argument(vtype: Any, name: str = "") -> ua.Argument:
         arg.DataType = ua.NodeId(vtype.value)
     elif isinstance(vtype, ua.NodeId):
         arg.DataType = vtype
-    elif hasattr(vtype, "nodeid"):  # NodeId case but we cannot import Node object here
+    elif hasattr(vtype, "nodeid"):
         arg.DataType = vtype.nodeid
     elif hasattr(vtype, "__name__") and hasattr(ua.VariantType, vtype.__name__):
         arg.DataType = ua.NodeId(ua.VariantType[vtype.__name__].value)
@@ -562,17 +531,17 @@ def _guess_datatype(variant: ua.Variant) -> ua.NodeId:
             raise ua.UaError("Cannot guess DataType from Null ExtensionObject")
         if isinstance(variant.Value, list | tuple):
             if len(variant.Value) == 0:
-                raise ua.UaError("Cannot guess DataType from Null ExtensionObject")
+                raise ua.UaError("Cannot guess the DataType of an empty ExtensionObject array, give the datatype")
             extobj = variant.Value[0]
         else:
             extobj = variant.Value
-        classname = extobj.__class__.__name__
-        if hasattr(ua.ObjectIds, classname):
-            return ua.NodeId(getattr(ua.ObjectIds, classname))
         data_type = ua.data_type_of_class(extobj.__class__)
         if data_type is not None:
             return data_type
-        raise ua.UaError(f"Cannot guess DataType of {variant} of python type {type(variant)}")
+        classname = extobj.__class__.__name__
+        if hasattr(ua.ObjectIds, classname):
+            return ua.NodeId(getattr(ua.ObjectIds, classname))
+        raise ua.UaError(f"Cannot guess the DataType of {extobj!r} of Python type {type(extobj).__name__}")
     return ua.NodeId(getattr(ua.ObjectIds, variant.VariantType.name))
 
 

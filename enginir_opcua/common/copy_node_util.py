@@ -1,3 +1,7 @@
+"""
+Copying nodes, alone or with everything they aggregate, and the shared steps of copying and instantiating.
+"""
+
 from __future__ import annotations
 
 import logging

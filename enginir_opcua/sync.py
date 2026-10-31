@@ -1598,6 +1598,7 @@ class SyncNode:
         bname: ua.QualifiedName | str,
         datatype: ua.NodeId | int,
         is_abstract: bool = False,
+        value: Any = None,
     ) -> SyncNode: ...
 
     @syncmethod

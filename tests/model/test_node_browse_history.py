@@ -133,6 +133,15 @@ async def test_com16_event_history_follows_continuation_points() -> None:
     assert session.history_calls[1].NodesToRead[0].ContinuationPoint == b"a"
 
 
+async def test_history_without_history_data_is_empty() -> None:
+    """Part 4, 5.11.3: a GoodNoData result may carry a null HistoryData."""
+    session = FakeSession()
+    session.history_results = [ua.HistoryReadResult(StatusCode=ua.StatusCode(ua.StatusCodes.GoodNoData))] * 2
+    session.browse_results = [ua.BrowseResult()]
+    assert await node(session).read_raw_history() == []
+    assert await node(session).read_event_history() == []
+
+
 async def test_com17_incompletely_resolved_target_is_not_found() -> None:
     session = FakeSession()
     session.translate_results = [

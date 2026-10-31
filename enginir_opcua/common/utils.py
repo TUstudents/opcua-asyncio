@@ -9,34 +9,35 @@ import logging
 import os
 from collections.abc import Awaitable
 from dataclasses import Field, fields
-from typing import Any, get_type_hints
+from typing import TYPE_CHECKING, Any, get_type_hints
 
 from ..ua.uaerrors import UaError
+
+if TYPE_CHECKING:
+    from ..ua.uatypes import TypeRegistry
 
 _logger = logging.getLogger(__name__)
 
 
 class ServiceError(UaError):
+    """A service failure with the StatusCode code, which the server answers with a ServiceFault."""
+
     def __init__(self, code: int) -> None:
         super().__init__("UA Service Error")
         self.code = code
 
 
 class NotEnoughData(UaError):
-    pass
-
-
-class SocketClosedException(UaError):
-    pass
+    """A read past the end of a Buffer."""
 
 
 class Buffer:
     """
-    Alternative to io.BytesIO making debug easier
-    and added a few convenience methods.
+    A read cursor over a window of bytes, used by the binary decoder. types is the TypeRegistry of the connection,
+    which decodes ExtensionObjects.
     """
 
-    def __init__(self, data: bytes, start_pos: int = 0, size: int = -1, types: Any = None) -> None:
+    def __init__(self, data: bytes, start_pos: int = 0, size: int = -1, types: TypeRegistry | None = None) -> None:
         if start_pos < 0 or start_pos > len(data):
             raise UaError(f"Buffer start {start_pos} is outside the data of {len(data)} bytes")
         if size == -1:
@@ -95,6 +96,7 @@ class Buffer:
 
     @property
     def cur_pos(self) -> int:
+        """The position of the cursor in the underlying data."""
         return self._cur_pos
 
     def rewind(self, cur_pos: int | None = None) -> None:
@@ -109,6 +111,7 @@ class Buffer:
 
 
 def create_nonce(size: int = 32) -> bytes:
+    """size random bytes from the operating system's secure source."""
     return os.urandom(size)
 
 

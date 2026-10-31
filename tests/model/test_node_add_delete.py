@@ -507,10 +507,8 @@ async def test_com20_array_dimensions_are_unknown_maximums(srv: Server) -> None:
 
 async def test_com20_falsy_initial_value_of_variable_type_is_kept(srv: Server) -> None:
     parent = srv.get_node(ua.ObjectIds.BaseDataVariableType)
-    nodeid = await manage_nodes._create_variable_type(
-        srv.iserver.isession, parent.nodeid, new_id("vt0"), ua.QualifiedName("vt0", 2), ua.NodeId(ua.ObjectIds.Int32), 0
-    )
-    assert (await srv.get_node(nodeid).read_value()) == 0
+    node = await parent.add_variable_type(new_id("vt0"), "2:vt0", ua.NodeId(ua.ObjectIds.Int32), value=0)
+    assert (await node.read_value()) == 0
 
 
 async def test_com98_scalar_variable_type_has_scalar_value_rank(srv: Server) -> None:

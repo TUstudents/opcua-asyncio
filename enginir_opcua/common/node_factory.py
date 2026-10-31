@@ -6,10 +6,7 @@ from enginir_opcua.common.session_interface import AbstractSession
 
 
 def make_node(session: AbstractSession, nodeid: ua.NodeId) -> enginir_opcua.Node:
-    """
-    Node factory
-    Needed no break cyclical import of `Node`
-    """
+    """A Node, for modules that node.py imports and that therefore cannot import it at load time."""
     from .node import Node
 
     return Node(session, nodeid)

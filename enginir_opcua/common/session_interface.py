@@ -14,6 +14,7 @@ class AbstractSession(ABC):
 
     @property
     def observer(self) -> Observer:
+        """The observer that sees the requests of the session; by default one that ignores them."""
         return NULL_OBSERVER
 
     @abstractmethod

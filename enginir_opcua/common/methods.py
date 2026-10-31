@@ -1,5 +1,5 @@
 """
-High level method related functions
+Calling Methods (OPC 10000-4 v1.05, 5.12.2) and writing their server-side implementations (uamethod).
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ _FLOATS = (ua.VariantType.Float, ua.VariantType.Double)
 
 async def call_method(
     parent: enginir_opcua.Node,
-    methodid: ua.NodeId | ua.QualifiedName | str,
+    methodid: enginir_opcua.Node | ua.NodeId | ua.QualifiedName | str,
     *args: Any,
     timeout: float | None = None,
 ) -> Any:
@@ -52,20 +52,22 @@ async def call_method(
 
 async def call_method_full(
     parent: enginir_opcua.Node,
-    methodid: ua.NodeId | ua.QualifiedName | str,
+    methodid: enginir_opcua.Node | ua.NodeId | ua.QualifiedName | str,
     *args: Any,
     timeout: float | None = None,
 ) -> ua.CallMethodResult:
     """
     Like call_method, but returns the CallMethodResult whose OutputArguments is always the list of output values.
     """
-    if isinstance(methodid, str | ua.uatypes.QualifiedName):
-        methodid = (await parent.get_child(methodid)).nodeid
-    elif hasattr(methodid, "nodeid"):
-        methodid = methodid.nodeid
+    if isinstance(methodid, str | ua.QualifiedName):
+        method = (await parent.get_child(methodid)).nodeid
+    elif isinstance(methodid, ua.NodeId):
+        method = methodid
+    else:
+        method = methodid.nodeid
 
-    arguments = await convert_arguments(parent.session, methodid, args)
-    result = await _call_method(parent.session, parent.nodeid, methodid, arguments, timeout)
+    arguments = await convert_arguments(parent.session, method, args)
+    result = await _call_method(parent.session, parent.nodeid, method, arguments, timeout)
     if result.OutputArguments is None:
         result.OutputArguments = []
     result.OutputArguments = [var.Value for var in result.OutputArguments]
@@ -101,6 +103,7 @@ async def _call_method(
 
 
 def forget_input_arguments(session: Any) -> None:
+    """Drop the InputArguments cached for the session, for example after it reconnected to another server."""
     _input_arguments.pop(session, None)
 
 
@@ -183,8 +186,9 @@ def _convert_scalar(value: Any, variant_type: ua.VariantType, index: int) -> Any
 
 def uamethod(func: Any) -> Any:
     """
-    Method decorator to automatically convert
-    arguments and output to and from variants
+    Decorator for the Python implementation of a Method: the function gets the parent NodeId (after self for a
+    method of a class) and the input values instead of Variants, and may return None, a value, a tuple of values,
+    a StatusCode or a CallMethodResult; values are turned into output Variants.
     """
 
     if inspect.iscoroutinefunction(func):

@@ -89,6 +89,18 @@ async def test_custom_struct_(opc):
     assert val.MyUInt32 == [78, 79]
 
 
+async def test_variable_of_a_custom_struct_named_like_a_standard_type_gets_its_own_data_type(
+    server, restore_ua_registry
+):
+    idx = await server.register_namespace("urn:test:guess-data-type")
+    dtype, _ = await new_struct(server, idx, "Range", [new_struct_field("Width", ua.VariantType.Double)])
+    await server.load_data_type_definitions()
+    cls = server.types.find_own(dtype.nodeid)
+    value = ua.Variant(cls(Width=2.0), ua.VariantType.ExtensionObject)
+    var = await server.nodes.objects.add_variable(idx, "CustomRange", value)
+    assert await var.read_data_type() == dtype.nodeid
+
+
 async def test_custom_struct_with_optional_fields(opc):
     idx = 4
 

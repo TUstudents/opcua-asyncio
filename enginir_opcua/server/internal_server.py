@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 
 from enginir_opcua import ua
 
-from ..common.callback import CallbackService
+from ..common.callback import CallbackService, CallbackType
 from ..common.connection import ChannelSettings
 from ..common.node import Node
 from ..common.utils import ServiceError
@@ -500,13 +500,13 @@ class InternalServer:
         """
         await self.history_manager.dehistorize(source)
 
-    def subscribe_server_callback(self, event: str, handle: Callable[..., Any]) -> None:
+    def subscribe_server_callback(self, event: CallbackType, handle: Callable[..., Any]) -> None:
         """
-        Create a subscription from event to handle
+        Call handle for every event of this type
         """
         self.callback_service.addListener(event, handle)
 
-    def unsubscribe_server_callback(self, event: str, handle: Callable[..., Any]) -> None:
+    def unsubscribe_server_callback(self, event: CallbackType, handle: Callable[..., Any]) -> None:
         """
         Remove a subscription from event to handle
         """

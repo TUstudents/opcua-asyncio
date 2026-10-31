@@ -1,5 +1,5 @@
 """
-Useful methods and classes not belonging anywhere and depending on enginir_opcua library
+Helpers on top of the ua types and the Node API: values as text and back, type hierarchies, DataTypes.
 """
 
 from __future__ import annotations
@@ -8,7 +8,7 @@ import logging
 import uuid
 from dataclasses import fields
 from datetime import datetime
-from enum import Enum, IntEnum, IntFlag
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from dateutil import parser  # type: ignore[attr-defined]
@@ -19,20 +19,19 @@ from enginir_opcua import ua
 from ..ua.ua_binary import get_string_encoding
 
 if TYPE_CHECKING:
+    from enginir_opcua import Server
     from enginir_opcua.common.node import Node
 
 _logger = logging.getLogger(__name__)
 
 
 def value_to_datavalue(val: Any, varianttype: ua.VariantType | None = None) -> ua.DataValue:
-    """
-    convert anything to a DataValue using varianttype
-    """
+    """A DataValue as it is, a Variant wrapped in a DataValue, or any other value as a Variant of varianttype."""
     if isinstance(val, ua.DataValue):
         return val
     if isinstance(val, ua.Variant):
         return ua.DataValue(val)
-    return ua.DataValue(ua.Variant(val, varianttype))
+    return ua.DataValue(ua.Variant(val) if varianttype is None else ua.Variant(val, varianttype))
 
 
 INTEGER_RANGES = {
@@ -45,6 +44,12 @@ INTEGER_RANGES = {
     ua.VariantType.Int64: (-(2**63), 2**63 - 1),
     ua.VariantType.UInt64: (0, 2**64 - 1),
 }
+_ABSTRACT_NUMBER_TYPES = (
+    ua.ObjectIds.BaseDataType,
+    ua.ObjectIds.Number,
+    ua.ObjectIds.Integer,
+    ua.ObjectIds.UInteger,
+)
 _BOOLEANS = {"true": True, "false": False, "1": True, "0": False}
 _QUOTE_TRIGGERS = ('"', ",", "[", "]")
 
@@ -82,10 +87,10 @@ def _text_of(val: Any, truncate: bool) -> str:
         val = val.to_string()
     elif isinstance(val, ua.StatusCode):
         val = val.name
-    elif isinstance(val, Enum | IntEnum | IntFlag):
+    elif isinstance(val, Enum):
         val = val.name
     elif isinstance(val, ua.DataValue):
-        val = variant_to_string(val.Value)
+        val = variant_to_string(val.Value) if val.Value is not None else ""
     elif isinstance(val, ua.XmlElement):
         val = val.Value
     elif isinstance(val, str):
@@ -239,7 +244,7 @@ def _convert_scalar_text(string: str, vtype: Any) -> Any:
     if vtype == ua.VariantType.LocalizedText:
         return ua.LocalizedText.from_string(string)
     if vtype == ua.VariantType.StatusCode:
-        return ua.StatusCode(string)
+        return ua.StatusCode(int(string)) if string.isdigit() else ua.StatusCode(getattr(ua.StatusCodes, string))
     if vtype == ua.VariantType.Guid:
         return uuid.UUID(string)
     if isinstance(vtype, type) and issubclass(vtype, Enum):
@@ -259,9 +264,7 @@ def _enum_from_string(string: str, vtype: Any) -> Any:
 
 
 def string_to_variant(string: str, vtype: Any) -> ua.Variant:
-    """
-    convert back a string to an ua.Variant
-    """
+    """The Variant of vtype for a text written by variant_to_string."""
     return ua.Variant(string_to_val(string, vtype), vtype)
 
 
@@ -307,32 +310,20 @@ async def get_node_supertypes(node: Node, includeitself: bool = False, skipbase:
     :param skipbase: drop the last element of the chain, the top type
     :returns list of Nodes, the nearest supertype first
     """
-    parents = []
-    if includeitself:
-        parents.append(node)
-    parents.extend(await _get_node_supertypes(node))
+    parents = [node] if includeitself else []
+    seen = {node.nodeid}
+    parent = await get_node_supertype(node)
+    while parent is not None and parent.nodeid not in seen:
+        seen.add(parent.nodeid)
+        parents.append(parent)
+        parent = await get_node_supertype(parent)
     if skipbase and len(parents) > 1:
         parents = parents[:-1]
     return parents
 
 
-async def _get_node_supertypes(node: Node) -> list[Node]:
-    """
-    recursive implementation of get_node_derived_from_types
-    """
-    basetypes = []
-    parent = await get_node_supertype(node)
-    if parent:
-        basetypes.append(parent)
-        basetypes.extend(await _get_node_supertypes(parent))
-
-    return basetypes
-
-
 async def get_node_supertype(node: Node) -> Node | None:
-    """
-    return node supertype or None
-    """
+    """The supertype of a type (the first inverse HasSubtype reference), None for a top type."""
     supertypes = await node.get_referenced_nodes(refs=ua.ObjectIds.HasSubtype, direction=ua.BrowseDirection.Inverse)
     if supertypes:
         return supertypes[0]
@@ -340,57 +331,42 @@ async def get_node_supertype(node: Node) -> Node | None:
 
 
 async def is_subtype(node: Node, supertype: ua.NodeId) -> bool:
-    """
-    return if a node is a subtype of a specified nodeid
-    """
-    while node:
-        if node.nodeid == supertype:
+    """Whether the type node is supertype or one of its subtypes."""
+    current: Node | None = node
+    seen: set[ua.NodeId] = set()
+    while current is not None and current.nodeid not in seen:
+        if current.nodeid == supertype:
             return True
-        node = await get_node_supertype(node)
+        seen.add(current.nodeid)
+        current = await get_node_supertype(current)
     return False
 
 
 async def is_child_present(node: Node, browsename: ua.QualifiedName) -> bool:
-    """
-    return if a browsename is present a child from the provide node
-    :param node: node wherein to find the browsename
-    :param browsename: browsename to search
-    :returns returns True if the browsename is present else False
-    """
-    child_descs = await node.get_children_descriptions()
-    for child_desc in child_descs:
-        if child_desc.BrowseName == browsename:
-            return True
-    return False
+    """Whether the node has a child (along hierarchical references) with this BrowseName."""
+    return any(desc.BrowseName == browsename for desc in await node.get_children_descriptions())
 
 
 async def data_type_to_variant_type(dtype_node: Node) -> ua.VariantType:
     """
-    Given a Node datatype, find out the variant type to encode
-    data. This is not exactly straightforward...
+    The VariantType that encodes values of a DataType: that of its built-in base type, Int32 for an
+    Enumeration, and Variant for the abstract BaseDataType, Number, Integer and UInteger.
     """
     base = await get_base_data_type(dtype_node)
-    if base.nodeid.Identifier == 29:
-        # we have an enumeration, value is an Int32
+    identifier = base.nodeid.Identifier
+    if not isinstance(identifier, int):
+        raise ua.UaError(f"{base.nodeid} is not a built-in DataType")
+    if identifier == ua.ObjectIds.Enumeration:
         return ua.VariantType.Int32
-    if base.nodeid.Identifier in [24, 26, 27, 28]:
-        # BaseDataType, Number, Integer, UInteger -> Variant
+    if identifier in _ABSTRACT_NUMBER_TYPES:
         return ua.VariantType.Variant
-    return ua.VariantType(base.nodeid.Identifier)
+    return ua.VariantType(identifier)
 
 
 async def get_base_data_type(datatype: Node) -> Node:
     """
-    Looks up the base datatype of the provided datatype Node
-    The base datatype is either:
-    A primitive type (ns=0, i<=21) or a complex one (ns=0 i>21 and i<30) like Enum and Struct.
-
-    Args:
-        datatype: Node of a DataType
-    Returns:
-        Node of the built-in base type
-    Raises:
-        UaError: the DataType is not derived from a built-in type
+    The nearest built-in DataType of namespace 0 that the DataType is or derives from: a built-in type (i=1 to 25),
+    Number, Integer, UInteger or Enumeration (up to i=29). Raises UaError if there is none.
     """
     base: Node | None = datatype
     seen: set[ua.NodeId] = set()
@@ -402,7 +378,7 @@ async def get_base_data_type(datatype: Node) -> Node:
     raise ua.UaError(f"Datatype must be a subtype of builtin types {datatype!s}")
 
 
-async def get_nodes_of_namespace(server: Any, namespaces: list[str | int] | None = None) -> list[Node]:
+async def get_nodes_of_namespace(server: Server, namespaces: list[str | int] | str | int | None = None) -> list[Node]:
     """
     Get the nodes of one or more namespaces from a local Server.
 
@@ -417,7 +393,7 @@ async def get_nodes_of_namespace(server: Any, namespaces: list[str | int] | None
     elif isinstance(namespaces, str | int):
         namespaces = [namespaces]
 
-    namespace_indexes = set()
+    namespace_indexes: set[int] = set()
     for namespace in namespaces:
         if isinstance(namespace, int):
             namespace_indexes.add(namespace)
@@ -431,21 +407,11 @@ async def get_nodes_of_namespace(server: Any, namespaces: list[str | int] | None
     ]
 
 
-def get_default_value(uatype: Any) -> Any:
-    if isinstance(uatype, ua.VariantType):
-        return ua.get_default_value(uatype)
-    if hasattr(ua.VariantType, uatype):
-        return ua.get_default_value(getattr(ua.VariantType, uatype))
-    return getattr(ua, uatype)()
-
-
 def data_type_to_string(dtype: ua.NodeId) -> str:
-    # we could just display browse name of node, but it requires a query
-    if dtype.NamespaceIndex == 0 and dtype.Identifier in ua.ObjectIdNames:
-        string = ua.ObjectIdNames[dtype.Identifier]  # type: ignore[index]
-    else:
-        string = dtype.to_string()
-    return string
+    """The name of a DataType of namespace 0 without a service call, the NodeId text for other DataTypes."""
+    if dtype.NamespaceIndex == 0 and isinstance(dtype.Identifier, int) and dtype.Identifier in ua.ObjectIdNames:
+        return ua.ObjectIdNames[dtype.Identifier]
+    return dtype.to_string()
 
 
 def copy_dataclass_attr(dc_source: Any, dc_dest: Any) -> None:

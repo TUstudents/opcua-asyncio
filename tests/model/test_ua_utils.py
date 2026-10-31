@@ -134,6 +134,18 @@ async def test_com11_supertype_order_and_skipbase(server: Server) -> None:
     ]
 
 
+async def test_supertypes_stop_at_a_cycle(server: Server, monkeypatch: pytest.MonkeyPatch) -> None:
+    first, second = server.get_node(ua.NodeId(1, 9)), server.get_node(ua.NodeId(2, 9))
+    loop = {first.nodeid: second, second.nodeid: first}
+
+    async def supertype(node: Any) -> Any:
+        return loop[node.nodeid]
+
+    monkeypatch.setattr(ua_utils, "get_node_supertype", supertype)
+    chain = await ua_utils.get_node_supertypes(first, includeitself=True, skipbase=False)
+    assert [n.nodeid for n in chain] == [first.nodeid, second.nodeid]
+
+
 async def test_com107_get_node_children_stops_at_cycle(server: Server) -> None:
     idx = await server.register_namespace("urn:test:cycle")
     top = await server.nodes.objects.add_folder(idx, "Top")

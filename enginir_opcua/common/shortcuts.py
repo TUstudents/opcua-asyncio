@@ -4,9 +4,7 @@ from .session_interface import AbstractSession
 
 
 class Shortcuts:
-    """
-    This object contains Node objects to some commonly used nodes
-    """
+    """Nodes of namespace 0 that applications use often, such as the Objects folder and the base types."""
 
     root: Node
     objects: Node
