@@ -403,6 +403,31 @@ async def test_cli50_failover_is_not_delayed_by_a_hung_reconciliation() -> None:
     await asyncio.wait_for(run, 1)
 
 
+async def test_ha_mi_request_hook_fires_once_per_change() -> None:
+    """The metrics hook sees each change once with all its nodes, and nothing when no node changes."""
+    from enginir_opcua.client.ha.reconciliator import Method
+    from enginir_opcua.client.ha.virtual_subscription import NodeAttr, VirtualSubscription
+
+    ha, _first, _second = make_ha(batch_mi_size=2)
+    reconciliator = ha.reconciliator
+    url = ha.urls[0]
+    nodes = [f"ns=2;i={i}" for i in range(5)]
+    real = VirtualSubscription(100, None, True, ua.MonitoringMode.Reporting)
+    for node in nodes:
+        real.nodes[node] = NodeAttr(ua.AttributeIds.Value, 0)
+    ideal = VirtualSubscription(100, None, True, ua.MonitoringMode.Reporting)
+
+    class FakeSubscription:
+        async def unsubscribe(self, handles: Any) -> None:
+            return None
+
+    reconciliator.name_to_subscription[url]["sub"] = FakeSubscription()  # type: ignore[assignment]
+    calls: list[dict[str, Any]] = []
+    reconciliator.hook_mi_request = lambda **kwargs: calls.append(kwargs)  # type: ignore[method-assign]
+    await reconciliator.update_nodes({url: {"sub": real}}, {url: {"sub": ideal}}, {url})
+    assert [(call["action"], set(call["nodes"])) for call in calls] == [(Method.DEL_MI, set(nodes))]
+
+
 async def test_ha_status_snapshot_and_failover_hook() -> None:
     ha, first, second = make_ha()
     set_levels(ha, 255, 150)

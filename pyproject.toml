@@ -92,11 +92,7 @@ disable_error_code = ["literal-required", "name-defined"]
 [[tool.mypy.overrides]]
 module = [
   "enginir_opcua.common.*",
-  "enginir_opcua.client.client",
-  "enginir_opcua.client.ua_client",
-  "enginir_opcua.client.ua_file",
-  "enginir_opcua.client.ua_file_transfer",
-  "enginir_opcua.client.ua_session",
+  "enginir_opcua.client.*",
   "enginir_opcua.crypto.*",
   "enginir_opcua.ua.attribute_ids",
   "enginir_opcua.ua.numeric_range",
@@ -108,10 +104,6 @@ module = [
 ]
 check_untyped_defs = true
 enable_error_code = ["misc", "arg-type", "assignment", "var-annotated"]
-
-[[tool.mypy.overrides]]
-module = "enginir_opcua.client.*"
-check_untyped_defs = true
 
 [[tool.mypy.overrides]]
 module = "asynctest.*"
@@ -201,5 +193,4 @@ ignore = [
 "enginir_opcua/server/standard_address_space/**" = ["ANN"]
 "enginir_opcua/common/event_objects.py" = ["ANN"]
 # Non-typed files still needing work
-"enginir_opcua/client/ha/**" = ["ANN"]
 "enginir_opcua/server/uaprocessor.py" = ["ANN"]

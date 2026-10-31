@@ -1,3 +1,7 @@
+"""
+HaClient: one client over redundant servers, with the Warm failover mode of OPC 10000-4 v1.05, 6.6.2.4.5.3.
+"""
+
 import asyncio
 import logging
 import time
@@ -33,23 +37,19 @@ SUB_NAME_COUNT = 9999
 
 class HaMode(IntEnum):
     """
-    Failover modes of OPC 10000-4 v1.05, 6.6.2.4.5. Only WARM is implemented; the other values name the modes of the
-    specification and are refused by `HaClient` with a NotImplementedError.
+    Failover modes of OPC 10000-4 v1.05, 6.6.2.4.5: COLD (6.6.2.4.5.2), WARM (6.6.2.4.5.3: the standby clients create
+    the MonitoredItems but disable sampling and publishing), HOT_A and HOT_B (6.6.2.4.5.4). Only WARM is implemented;
+    `HaClient` refuses the others with a NotImplementedError.
     """
 
-    # OPC UA Part 4 - 6.6.2.4.5.2 - Cold (not implemented)
     COLD = 0
-    # OPC UA Part 4 - 6.6.2.4.5.3 - Warm
-    # Secondary clients create the MonitoredItems,
-    # but disable sampling and publishing.
     WARM = 1
-    # OPC UA Part 4 - 6.6.2.4.5.4 - Hot A (not implemented)
     HOT_A = 2
-    # OPC UA Part 4 - 6.6.2.4.5.4 - Hot B (not implemented)
     HOT_B = 3
 
 
 def classify_service_level(level: int, healthy_state: int = ConnectionStates.HEALTHY) -> ConnectionStates:
+    """The band of a ServiceLevel; levels from healthy_state up are Healthy."""
     if level >= healthy_state:
         return ConnectionStates.HEALTHY
     if level >= ConnectionStates.DEGRADED:
@@ -71,6 +71,8 @@ def redundancy_accepted(mode: HaMode, support: ua.RedundancySupport | int | None
 
 @dataclass
 class ServerInfo:
+    """What the HaClient knows about one server: its last ServiceLevel, probe time, errors and redundancy check."""
+
     url: str
     status: int = ConnectionStates.NO_DATA
     retry_at: float | None = None
@@ -81,6 +83,14 @@ class ServerInfo:
 
 @dataclass(frozen=True, eq=True)
 class HaSecurityConfig:
+    """
+    The security and identity of every client of an HaClient (see HaClient.set_security), or the quick setup
+    (HaClient.quickstart): `pki` is the PKI directory that every client uses for its certificate, key and trust,
+    `profile` the quick-setup profile, `application_uri` the ApplicationUri of every client (default: the host-derived
+    URI of Client.quickstart) and `client_settings` more ClientConfig fields. With the quick setup the clients are
+    created by the HaClient constructor, so a later set_security() does not reach them and the policy fields stay unused.
+    """
+
     policy: type[SecurityPolicy] | None = None
     certificate: CertProperties | None = None
     private_key: CertProperties | None = None
@@ -95,12 +105,6 @@ class HaSecurityConfig:
     profile: str = "secure"
     application_uri: str | None = None
     client_settings: Mapping[str, Any] = field(default_factory=dict)
-    """
-    The quick setup (HaClient.quickstart): `pki` is the PKI directory that every client uses for its certificate, key
-    and trust, `profile` the quick-setup profile, `application_uri` the ApplicationUri of every client (default: the
-    host-derived URI of Client.quickstart) and `client_settings` more ClientConfig fields. The clients are created by
-    the HaClient constructor, so a later set_security() does not reach them; the policy fields above stay unused.
-    """
 
     def __post_init__(self) -> None:
         if self.policy is not None and self.server_certificate is None and self.trust_store is None:
@@ -145,11 +149,10 @@ class HaClient:
     - Time synchronization (e.g NTP)
 
     It starts the OPC-UA clients and connect to the server that
-    fits in the HaMode selected.
+    fits in the HaMode selected. Subclasses may change HEALTHY_STATE for servers with other ServiceLevels (an OPC UA
+    proxy, for example) and override the hook_ methods, which do nothing.
     """
 
-    # Override this if your servers require custom ServiceLevels
-    # i.e: You're using an OPC-UA proxy
     HEALTHY_STATE = ConnectionStates.HEALTHY
 
     def __init__(self, config: HaConfig, security: HaSecurityConfig | None = None) -> None:
@@ -158,12 +161,10 @@ class HaClient:
         if len(config.urls) < 2 or len(set(config.urls)) != len(config.urls):
             raise ValueError("HaConfig needs at least two distinct urls")
         self._config: HaConfig = config
-        self._keepalive_task: dict[KeepAlive, asyncio.Task] = {}
-        self._manager_task: dict[HaManager, asyncio.Task] = {}
-        self._reconciliator_task: dict[Reconciliator, asyncio.Task] = {}
+        self._keepalive_task: dict[KeepAlive, asyncio.Task[None]] = {}
+        self._manager_task: dict[HaManager, asyncio.Task[None]] = {}
+        self._reconciliator_task: dict[Reconciliator, asyncio.Task[None]] = {}
         self._gen_sub: Generator[str, None, None] = self.generate_sub_name()
-
-        # An event loop must be set in the current thread
         self._url_to_reset_lock = asyncio.Lock()
         self._ideal_map_lock: asyncio.Lock = asyncio.Lock()
         self._client_lock: asyncio.Lock = asyncio.Lock()
@@ -171,7 +172,6 @@ class HaClient:
         self.clients: dict[Client, ServerInfo] = {}
         self.active_client: Client | None = None
         self._active_since: float | None = None
-        # full type: dict[str, Sorteddict[str, VirtualSubscription]]
         self.ideal_map: dict[str, SortedDict] = {}
         self.sub_names: set[str] = set()
         self.url_to_reset: set[str] = set()
@@ -183,7 +183,6 @@ class HaClient:
         security = security if security else HaSecurityConfig()
         for url in config.urls:
             c = self._new_client(url, security)
-            # timeouts for the session and secure channel are in ms
             c.session_timeout = self._config.session_timeout * 1000
             c.secure_channel_timeout = self._config.secure_channel_timeout * 1000
             c.description = self._config.session_name
@@ -191,8 +190,6 @@ class HaClient:
             self.clients[c] = server_info
             self._ready[c] = asyncio.Event()
             self.ideal_map[url] = SortedDict()
-
-        # security can also be set via the set_security method
         self.security_config: HaSecurityConfig = security
         self.manager = HaManager(self, self._config.manager_timer)
         self.reconciliator = Reconciliator(self._config.reconciliator_timer, self)
@@ -232,6 +229,7 @@ class HaClient:
 
     @property
     def config(self) -> HaConfig:
+        """The configuration given to the constructor."""
         return self._config
 
     def _new_client(self, url: str, security: HaSecurityConfig) -> Client:
@@ -256,6 +254,7 @@ class HaClient:
         return await next(iter(self.clients)).init_pki()
 
     async def start(self) -> None:
+        """Start the keep-alive probes, the manager and the reconciliator; the clients connect in the background."""
         if self.security_config.pki is not None:
             await self.init_pki()
         for client, server in self.clients.items():
@@ -282,11 +281,10 @@ class HaClient:
         self.is_running = True
 
     def _watch_client_state(self, client: Client) -> None:
-        # Auto-reconnect on the underlying Client preserves the session and
-        # restores subscriptions, but the recreate() fallback assigns new
-        # server-side handles. After every RECONNECTING -> CONNECTED transition,
-        # refresh Reconciliator.node_to_handle so later unsubscribe calls use the
-        # current handles, and compare the modes with the ideal state.
+        """
+        After every RECONNECTING to CONNECTED transition refresh the handles of the reconciliator, since a recreated
+        Subscription has new server handles, and let it compare the modes with the ideal state.
+        """
         url = client.server_url.geturl()
         prev: UaClientState | None = None
 
@@ -303,6 +301,7 @@ class HaClient:
         self._state_listener_unsubs.append(unsub)
 
     async def stop(self) -> None:
+        """Stop the loops (waiting up to stop_grace for them), end the Subscriptions locally and disconnect."""
         for unsub in self._state_listener_unsubs:
             try:
                 unsub()
@@ -366,6 +365,7 @@ class HaClient:
         )
 
     def band_of(self, level: int) -> ConnectionStates:
+        """The band of a ServiceLevel with this client's HEALTHY_STATE."""
         return classify_service_level(level, self.HEALTHY_STATE)
 
     def _new_sub_name(self) -> str:
@@ -376,6 +376,7 @@ class HaClient:
             return next(self._gen_sub)
 
     async def create_subscription(self, period: int, handler: TypeSubHandler) -> str:
+        """Add a Subscription on every server (publishing only on the active one) and return its name."""
         async with self._ideal_map_lock:
             sub_name = self._new_sub_name()
             for client in self.clients:
@@ -414,9 +415,10 @@ class HaClient:
         self,
         sub_name: str,
         nodes: Iterable[Node] | Iterable[str],
-        attr=ua.AttributeIds.Value,
-        queuesize=0,
+        attr: ua.AttributeIds = ua.AttributeIds.Value,
+        queuesize: int = 0,
     ) -> None:
+        """Monitor the nodes (Nodes or NodeId texts) in the named Subscription on every server; KeyError if unknown."""
         node_ids = self._node_strings(nodes)
         async with self._ideal_map_lock:
             if sub_name not in self.sub_names or any(sub_name not in self.ideal_map[url] for url in self.urls):
@@ -428,6 +430,7 @@ class HaClient:
         self.reconciliator.wake()
 
     async def delete_subscriptions(self, sub_names: list[str]) -> None:
+        """Remove the named Subscriptions from every server; KeyError for an unknown name, removing none."""
         async with self._ideal_map_lock:
             unknown = [n for n in sub_names if n not in self.sub_names]
             if unknown:
@@ -446,12 +449,11 @@ class HaClient:
             client.set_password(security.password)
         if security.user_certificate is not None:
             await client.load_client_certificate(
-                security.user_certificate.path_or_content,
-                security.user_certificate.extension,  # type: ignore[arg-type]
+                security.user_certificate.path_or_content, security.user_certificate.extension
             )
         if security.user_private_key is not None:
             await client.load_private_key(
-                security.user_private_key.path_or_content,  # type: ignore[arg-type]
+                security.user_private_key.path_or_content,
                 security.user_private_key.password,
                 security.user_private_key.extension,
             )
@@ -483,10 +485,10 @@ class HaClient:
                     client.set_trust_store(security.trust_store)
                 await client.set_security(
                     policy=security.policy,
-                    certificate=security.certificate,  # type: ignore[arg-type]
-                    private_key=security.private_key,  # type: ignore[arg-type]
+                    certificate=security.certificate,
+                    private_key=security.private_key,
                     server_certificate=security.server_certificate,
-                    mode=security.mode,  # type: ignore[arg-type]
+                    mode=security.mode if security.mode is not None else ua.MessageSecurityMode.SignAndEncrypt,
                 )
             await client.connect(
                 auto_reconnect=True,
@@ -521,10 +523,11 @@ class HaClient:
             )
 
     async def unsubscribe(self, nodes: Iterable[Node] | Iterable[str]) -> None:
+        """Stop monitoring the nodes in every Subscription on every server."""
         node_set = set(self._node_strings(nodes))
         removed: list[tuple[str, set[str]]] = []
         async with self._ideal_map_lock:
-            sub_to_nodes = {}
+            sub_to_nodes: dict[str, set[str]] = {}
             first_url = self.urls[0]
             for sub_name, vs in self.ideal_map[first_url].items():
                 to_del = node_set & vs.get_nodes()
@@ -539,6 +542,7 @@ class HaClient:
         self.reconciliator.wake()
 
     async def failover_warm(self, primary: Client | None, secondaries: Iterable[Client]) -> None:
+        """Make primary the active client (Reporting and publishing) and the secondaries standbys (Disabled)."""
         old = self.active_client
         async with self._ideal_map_lock:
             if primary:
@@ -571,8 +575,9 @@ class HaClient:
                 vs.publishing = publishing
 
     async def group_clients_by_health(self) -> tuple[list[Client], list[Client]]:
-        healthy = []
-        unhealthy = []
+        """The clients whose server is Healthy, and the others."""
+        healthy: list[Client] = []
+        unhealthy: list[Client] = []
         async with self._client_lock:
             for client, server in self.clients.items():
                 if server.status >= self.HEALTHY_STATE:
@@ -644,9 +649,11 @@ class HaClient:
         ]
 
     def get_client_warm_mode(self) -> list[Client]:
+        """In Warm mode every client is connected."""
         return list(self.clients)
 
     def get_clients(self) -> list[Client]:
+        """The clients the failover mode keeps connected."""
         ha_mode = self.ha_mode
         func = f"get_client_{ha_mode}_mode"
         get_clients = getattr(self, func)
@@ -655,7 +662,8 @@ class HaClient:
             active_clients = [active_clients]
         return active_clients
 
-    def get_client_by_url(self, url) -> Client:
+    def get_client_by_url(self, url: str) -> Client:
+        """The client of a server URL; ClientNotFound for another URL."""
         for client, srv_info in self.clients.items():
             if srv_info.url == url:
                 return client
@@ -663,14 +671,17 @@ class HaClient:
 
     @property
     def session_timeout(self) -> int:
+        """The session timeout in seconds."""
         return self._config.session_timeout
 
     @property
     def ha_mode(self) -> str:
+        """The failover mode in lower case, such as "warm"."""
         return self._config.ha_mode.name.lower()
 
     @property
     def urls(self) -> list[str]:
+        """The server URLs, in configuration order."""
         return self._config.urls
 
     def generate_sub_name(self) -> Generator[str, None, None]:
@@ -689,17 +700,17 @@ class HaClient:
             else:
                 raise RuntimeError("no free subscription name")
 
-    async def hook_on_reconnect(self, **kwargs):
-        pass
+    async def hook_on_reconnect(self, **kwargs: Any) -> None:
+        """Called before a client is reconnected, with client=."""
 
-    async def hook_on_subscribe(self, **kwargs):
-        pass
+    async def hook_on_subscribe(self, **kwargs: Any) -> None:
+        """Called for every server after nodes were added to a Subscription, with nodes=, attr=, queuesize=, url=."""
 
-    async def hook_on_unsubscribe(self, **kwargs):
-        pass
+    async def hook_on_unsubscribe(self, **kwargs: Any) -> None:
+        """Called for every server after nodes were removed, with url= and nodes=."""
 
     async def hook_on_failover(self, old_url: str | None, new_url: str | None) -> None:
-        pass
+        """Called after the active server changed."""
 
 
 class KeepAlive:
@@ -731,6 +742,7 @@ class KeepAlive:
         self.is_running: bool = False
 
     async def stop(self) -> None:
+        """End the probe loop."""
         self.stop_event.set()
 
     def _set_level(self, level: int) -> None:
@@ -741,6 +753,7 @@ class KeepAlive:
             self.on_change()
 
     async def run(self) -> None:
+        """Probe the server every timer seconds, after the client is ready, until stop()."""
         if self.ready is not None:
             ready_wait = asyncio.ensure_future(self.ready.wait())
             stop_wait = asyncio.ensure_future(self.stop_event.wait())
@@ -760,12 +773,16 @@ class KeepAlive:
                 _logger.exception("Unknown exception during keepalive liveness check")
                 self.server.errors += 1
                 self._set_level(ConnectionStates.NO_DATA)
-            _logger.info("ServiceLevel for %s: %s", self.server.url, self.server.status)
+            _logger.debug("ServiceLevel for %s: %s", self.server.url, self.server.status)
             if await event_wait(self.stop_event, self.timer):
                 self.is_running = False
                 break
 
     async def probe(self) -> None:
+        """
+        Read ServerState and ServiceLevel. A server that is not Running, or a failed read, counts as NoData; a
+        server in maintenance is not probed again before its EstimatedReturnTime (or maintenance_retry_interval).
+        """
         client = self.client
         server_info = self.server
         if server_info.retry_at is not None and time.monotonic() < server_info.retry_at:
@@ -776,20 +793,8 @@ class KeepAlive:
         try:
             async with asyncio.timeout(self.probe_timeout):
                 status, slevel = await client.read_values([client.nodes.server_state, client.nodes.service_level])
-        except BadSessionNotActivated:
-            _logger.warning("Session is not yet activated.")
-            self._set_level(ConnectionStates.NO_DATA)
-            return
-        except BadSessionClosed:
-            _logger.warning("Session is closed.")
-            self._set_level(ConnectionStates.NO_DATA)
-            return
-        except ConnectionError:
-            _logger.warning("No connection.")
-            self._set_level(ConnectionStates.NO_DATA)
-            return
-        except TimeoutError:
-            _logger.warning("Timeout when fetching state")
+        except (BadSessionNotActivated, BadSessionClosed, ConnectionError, TimeoutError) as error:
+            _logger.warning("Could not read the state of %s: %r", self.server.url, error)
             self._set_level(ConnectionStates.NO_DATA)
             return
         server_info.last_probe_at = time.monotonic()
@@ -818,8 +823,7 @@ class KeepAlive:
 
 class HaManager:
     """
-    The manager handles individual client connections
-    according to the selected HaMode
+    The manager elects the active client and brings the connections up or down, every timer seconds or when woken.
     """
 
     def __init__(self, ha_client: HaClient, timer: float | None = None) -> None:
@@ -830,13 +834,16 @@ class HaManager:
         self.is_running = False
         self.errors = 0
 
-    def set_loop_timer(self, timer: float | None):
-        return timer if timer else int(self.ha_client.session_timeout)
+    def set_loop_timer(self, timer: float | None) -> float:
+        """The loop period: timer, or the session timeout without one."""
+        return timer if timer else float(self.ha_client.session_timeout)
 
     def wake(self) -> None:
+        """Run the next step now."""
         self.wake_event.set()
 
     async def run(self) -> None:
+        """The manager loop, until stop()."""
         ha_mode = self.ha_client.ha_mode
         update_func = f"update_state_{ha_mode}"
         update_state = getattr(self, update_func)
@@ -847,7 +854,6 @@ class HaManager:
         _logger.info("Starting HaManager loop, checking every %.1fsec", self.timer)
         while self.is_running:
             try:
-                # failover happens here
                 await update_state()
                 await reconnect()
             except Exception:
@@ -859,9 +865,11 @@ class HaManager:
                 break
 
     async def stop(self) -> None:
+        """End the loop after the current step."""
         self.stop_event.set()
 
     async def update_state_warm(self) -> None:
+        """Elect the serving client and fail over to it if it changed."""
         active_client = self.ha_client.active_client
         clients = self.ha_client.get_clients()
         primary_client = await self.ha_client.get_serving_client(list(self.ha_client.clients), active_client)
@@ -878,11 +886,11 @@ class HaManager:
         ha_client = self.ha_client
         now = time.monotonic()
 
-        def log_exception(client: Client, fut: asyncio.Task):
+        def log_exception(client: Client, fut: asyncio.Task[None]) -> None:
             if not fut.cancelled() and fut.exception():
                 _logger.warning("Error when reconnecting %s: %s", client, fut.exception())
 
-        tasks = []
+        tasks: list[asyncio.Task[None]] = []
         for client, info in list(ha_client.clients.items()):
             state = client.uaclient.state
             if client in ha_client._resetting:

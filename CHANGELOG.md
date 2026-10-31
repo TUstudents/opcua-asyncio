@@ -156,6 +156,11 @@ High availability:
   (ServiceLevel 0). Probe and manager default to 5 s and wake each other. A server that reports no Warm or Hot
   `RedundancySupport` is not used unless `HaConfig(allow_unsupported_redundancy=True)`.
   `HaSecurityConfig` takes user credentials. Unknown subscription names raise `KeyError`; `HaClient.status()` is new.
+- `Reconciliator.hook_mi_request` is called once per change of the MonitoredItems of a Subscription, with all the
+  nodes it adds or removes; it was called for every batch of a removal with the whole set, and on every pass with an
+  empty set for additions. `Method.DEL_SUB` is "delete", the method that deletes the Subscription.
+- The keep-alive probe logs the ServiceLevel at DEBUG, and the reconciliator logs its timing and passes without
+  changes at DEBUG instead of INFO on every round. `Reconciliator.init_hooks`, which did nothing, is removed.
 
 Command line (`enginir-opcua`):
 - One command with subcommands replaces the eleven `enginir-ua*` scripts, which are deprecated aliases until 4.0.0.

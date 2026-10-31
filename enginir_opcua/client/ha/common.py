@@ -1,5 +1,10 @@
+"""
+Helpers of the high-availability client.
+"""
+
 import asyncio
 import logging
+from collections.abc import Iterable, Iterator
 from enum import IntEnum
 from itertools import chain, islice
 
@@ -9,13 +14,13 @@ _logger = logging.getLogger(__name__)
 
 
 class ClientNotFound(Exception):
-    pass
+    """A URL that is not one of the servers of the HaClient."""
 
 
 class ConnectionStates(IntEnum):
     """
-    OPC UA Part 4 - Services Release
-    Section 6.6.2.4.2 ServiceLevel
+    The ServiceLevel bands of OPC 10000-4 v1.05, 6.6.2.4.2: Maintenance (0), NoData (1), Degraded (2 to 199) and
+    Healthy (200 to 255); each member is the lowest level of its band.
     """
 
     IN_MAINTENANCE = 0
@@ -24,7 +29,8 @@ class ConnectionStates(IntEnum):
     HEALTHY = 200
 
 
-async def event_wait(evt, timeout) -> bool:
+async def event_wait(evt: asyncio.Event, timeout: float) -> bool:
+    """Wait for the event at most timeout seconds; whether it is set."""
     try:
         await wait_for(evt.wait(), timeout)
     except TimeoutError:
@@ -56,7 +62,8 @@ async def wait_any(timeout: float, stop: asyncio.Event, *wakeups: asyncio.Event)
     return stop.is_set()
 
 
-def batch(iterable, size):
+def batch[T](iterable: Iterable[T], size: int) -> Iterator[list[T]]:
+    """The items in lists of at most size."""
     iterator = iter(iterable)
     while True:
         try:
