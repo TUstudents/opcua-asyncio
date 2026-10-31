@@ -150,7 +150,7 @@ class HaClient:
 
     It starts the OPC-UA clients and connect to the server that
     fits in the HaMode selected. Subclasses may change HEALTHY_STATE for servers with other ServiceLevels (an OPC UA
-    proxy, for example) and override the hook_ methods, which do nothing.
+    proxy, for example) and override the hook methods (hook_on_failover and the others), which do nothing.
     """
 
     HEALTHY_STATE = ConnectionStates.HEALTHY

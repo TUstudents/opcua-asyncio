@@ -3,6 +3,8 @@ Helper function and classes that do not rely on enginir_opcua library.
 Helper function and classes depending on ua object are in ua_utils.py
 """
 
+from __future__ import annotations
+
 import asyncio
 import copy
 import logging

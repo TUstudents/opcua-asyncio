@@ -2,6 +2,8 @@
 The Reconciliator of the HaClient: it makes the Subscriptions on every server match the ideal map.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import time
@@ -48,7 +50,7 @@ class Reconciliator:
 
     After a successful reconciliation and if all the client status
     are >= HEALTHY_STATE, the ideal_map is equal to the real_map.
-    The hook_ methods are called on every change and do nothing; override them for metrics or external events.
+    The hook methods (hook_mi_request and the others) are called on every change and do nothing; override them for metrics or external events.
     """
 
     BATCH_MI_SIZE = 1000

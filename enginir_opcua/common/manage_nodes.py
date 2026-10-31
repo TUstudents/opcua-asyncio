@@ -1,7 +1,7 @@
 """
 Adding and deleting nodes with the NodeManagement services (OPC 10000-4 v1.05, 5.8).
 
-The create_ functions take the new node's NodeId and BrowseName in one of two forms: a NodeId (or its text form)
+The create functions take the new node's NodeId and BrowseName in one of two forms: a NodeId (or its text form)
 and a QualifiedName (or its "ns:Name" text form), or a namespace index and a plain name, for which the server picks
 the NodeId. The new node gets the parent through the reference the NodeClass needs (Organizes below a folder,
 HasComponent, HasProperty or HasSubtype).

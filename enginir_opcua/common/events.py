@@ -3,6 +3,8 @@ Events (OPC 10000-3 v1.05, 4.6; OPC 10000-4 v1.05, 7.7.3): the Event object, bui
 and turning a custom EventType of the address space into an Event to fire.
 """
 
+from __future__ import annotations
+
 import copy
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any

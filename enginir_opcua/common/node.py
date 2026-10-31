@@ -377,7 +377,7 @@ class Node:
     ) -> list[ua.ReferenceDescription]:
         """
         Browse the references of the node of type refs (and its subtypes with includesubtypes) in direction, keeping
-        targets of the NodeClasses in nodeclassmask (NodeClass values combined with |), and follow the continuation
+        targets of the NodeClasses in nodeclassmask (NodeClass values or-ed together), and follow the continuation
         points until all are read. result_mask selects the fields of the ReferenceDescriptions.
         """
         desc = ua.BrowseDescription()
@@ -813,7 +813,7 @@ class Node:
 
     async def add_folder(self, nodeid: ua.NodeId | str | int, bname: ua.QualifiedName | str) -> Node:
         """
-        Add a FolderType Object below this node. As for every add_ method, nodeid and bname are a NodeId (or its
+        Add a FolderType Object below this node. As for every add method, nodeid and bname are a NodeId (or its
         text) and a QualifiedName (or "ns:Name"), or a namespace index and a name in that namespace; see
         manage_nodes.
         """

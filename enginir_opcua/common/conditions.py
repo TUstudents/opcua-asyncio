@@ -16,7 +16,6 @@ if TYPE_CHECKING:
     from enginir_opcua import Client, Server
     from enginir_opcua.common.subscription import Subscription
 
-type ConditionHost = Client | Server
 
 _logger = logging.getLogger(__name__)
 
@@ -58,7 +57,7 @@ def _event_id(event_id: bytes | ua.Variant) -> ua.Variant:
 
 
 async def _call(
-    client: ConditionHost | AbstractSession, condition: Node | ua.NodeId, method: ua.NodeId, *arguments: ua.Variant
+    client: Client | Server | AbstractSession, condition: Node | ua.NodeId, method: ua.NodeId, *arguments: ua.Variant
 ) -> None:
     nodeid = _id(condition)
     get_node = getattr(client, "get_node", None)
@@ -67,7 +66,7 @@ async def _call(
 
 
 async def condition_event_filter(
-    client: ConditionHost, types: Node | ua.NodeId | int | Iterable[Node | ua.NodeId | int] = CONDITION_TYPE
+    client: Client | Server, types: Node | ua.NodeId | int | Iterable[Node | ua.NodeId | int] = CONDITION_TYPE
 ) -> ua.EventFilter:
     """
     The EventFilter of a current-alarm display: the fields of the types, the ConditionId and OfType as where
@@ -84,7 +83,7 @@ async def condition_event_filter(
 
 
 async def acknowledge(
-    client: ConditionHost | AbstractSession,
+    client: Client | Server | AbstractSession,
     condition: Node | ua.NodeId,
     event_id: bytes | ua.Variant,
     comment: str | ua.LocalizedText | None = None,
@@ -94,7 +93,7 @@ async def acknowledge(
 
 
 async def confirm(
-    client: ConditionHost | AbstractSession,
+    client: Client | Server | AbstractSession,
     condition: Node | ua.NodeId,
     event_id: bytes | ua.Variant,
     comment: str | ua.LocalizedText | None = None,
@@ -104,7 +103,7 @@ async def confirm(
 
 
 async def add_comment(
-    client: ConditionHost | AbstractSession,
+    client: Client | Server | AbstractSession,
     condition: Node | ua.NodeId,
     event_id: bytes | ua.Variant,
     comment: str | ua.LocalizedText,
@@ -113,29 +112,29 @@ async def add_comment(
     await _call(client, condition, ADD_COMMENT, _event_id(event_id), _comment(comment))
 
 
-async def enable(client: ConditionHost | AbstractSession, condition: Node | ua.NodeId) -> None:
+async def enable(client: Client | Server | AbstractSession, condition: Node | ua.NodeId) -> None:
     """Enable the Condition (Part 9, 5.5.5)."""
     await _call(client, condition, ENABLE)
 
 
-async def disable(client: ConditionHost | AbstractSession, condition: Node | ua.NodeId) -> None:
+async def disable(client: Client | Server | AbstractSession, condition: Node | ua.NodeId) -> None:
     """Disable the Condition (Part 9, 5.5.4)."""
     await _call(client, condition, DISABLE)
 
 
 async def timed_shelve(
-    client: ConditionHost | AbstractSession, condition: Node | ua.NodeId, milliseconds: float
+    client: Client | Server | AbstractSession, condition: Node | ua.NodeId, milliseconds: float
 ) -> None:
     """Shelve the alarm for the given time (Part 9, 5.8.17.4); condition is the alarm or its ShelvingState."""
     await _call(client, condition, TIMED_SHELVE, ua.Variant(float(milliseconds), ua.VariantType.Double))
 
 
-async def one_shot_shelve(client: ConditionHost | AbstractSession, condition: Node | ua.NodeId) -> None:
+async def one_shot_shelve(client: Client | Server | AbstractSession, condition: Node | ua.NodeId) -> None:
     """Shelve the alarm until it next goes inactive (Part 9, 5.8.17.6)."""
     await _call(client, condition, ONE_SHOT_SHELVE)
 
 
-async def unshelve(client: ConditionHost | AbstractSession, condition: Node | ua.NodeId) -> None:
+async def unshelve(client: Client | Server | AbstractSession, condition: Node | ua.NodeId) -> None:
     """End the shelving of the alarm (Part 9, 5.8.17.2)."""
     await _call(client, condition, UNSHELVE)
 
@@ -148,14 +147,14 @@ def _subscription_id(subscription: Subscription | int) -> int:
     return subscription.subscription_id
 
 
-async def condition_refresh(client: ConditionHost | AbstractSession, subscription: Subscription | int) -> None:
+async def condition_refresh(client: Client | Server | AbstractSession, subscription: Subscription | int) -> None:
     """ConditionRefresh for every Event item of a Subscription (Part 9, 5.5.7)."""
     argument = ua.Variant(_subscription_id(subscription), ua.VariantType.UInt32)
     await _call(client, CONDITION_TYPE, REFRESH, argument)
 
 
 async def condition_refresh2(
-    client: ConditionHost | AbstractSession, subscription: Subscription | int, monitored_item_id: int
+    client: Client | Server | AbstractSession, subscription: Subscription | int, monitored_item_id: int
 ) -> None:
     """ConditionRefresh2 for one item; a server without it (Bad_MethodInvalid) gets ConditionRefresh (Part 9, 5.5.8)."""
     arguments = [
