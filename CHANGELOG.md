@@ -101,6 +101,8 @@ Client subscriptions (OPC 10000-4, 5.13 and 5.14):
   return any awaitable. Duplicate messages are dropped and missing ones are fetched with Republish
   (`max_republish`, `republish_missing`). `Bad_Timeout` marks the Subscription lost; `Good_SubscriptionTransferred`
   ends it without recreating. `Subscription.close()` ends it locally; `Subscription.state` is new.
+- `Subscription.modify_monitored_item` takes a float deadband (`mod_filter_val`); a `UaStatusCodeError` raised for a
+  local service failure keeps the `ServiceError` as its cause, and `set_publishing_mode` no longer logs every call.
 
 File transfer (OPC 10000-5, Annex C):
 - `UaFile.read()` reads in chunks until an empty ByteString and no longer uses `Size`; `write()` is chunked.

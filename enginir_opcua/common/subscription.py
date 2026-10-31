@@ -1,5 +1,7 @@
 """
-high level interface to subscriptions
+Subscriptions and MonitoredItems (OPC 10000-4 v1.05, 5.13 and 5.14) for clients and for a server's own session:
+creating them, receiving their notifications in order through a handler or an async iterator, and keeping them
+alive across reconnects (TransferSubscriptions, Republish or re-creation).
 """
 
 from __future__ import annotations
@@ -58,9 +60,7 @@ class SubscriptionItemData:
 
 
 class DataChangeNotif:
-    """
-    To be send to clients for every datachange notification from server.
-    """
+    """The MonitoredItemNotification of one data change, with the data of the item it belongs to."""
 
     def __init__(self, subscription_data: SubscriptionItemData, monitored_item: ua.MonitoredItemNotification) -> None:
         self.monitored_item = monitored_item
@@ -129,10 +129,6 @@ SubscriptionHandler = (
     | StatusChangeNotificationHandlerAsync
 )
 
-"""
-Protocol class representing subscription handlers to receive events from server.
-"""
-
 
 @dataclass(frozen=True)
 class DataChangeEvent:
@@ -183,11 +179,13 @@ class RevisedParameters:
 
 
 def keep_alive_count_for(period: float, keep_alive_seconds: float) -> int:
+    """The MaxKeepAliveCount for a keep-alive about every keep_alive_seconds at this publishing interval (ms)."""
     nominal = period if period > 0 else 1000.0
     return max(1, math.ceil(keep_alive_seconds * 1000 / nominal))
 
 
 def lifetime_count_for(period: float, lifetime_seconds: float, keep_alive_count: int) -> int:
+    """The LifetimeCount for about lifetime_seconds, at least three keep-alive counts (OPC 10000-4 v1.05, 5.14.2.2)."""
     nominal = period if period > 0 else 1000.0
     return max(3 * keep_alive_count, math.ceil(lifetime_seconds * 1000 / nominal))
 
@@ -205,7 +203,8 @@ def subscription_parameters(
     """
     Build the parameters of CreateSubscription. The counts follow from times, not from the Session timeout, so a
     keep-alive arrives about every `keep_alive_seconds` whatever the interval, and the lifetime is at least three
-    times the keep-alive (OPC 10000-4 v1.05, 5.14.2.2). `session_timeout` in milliseconds limits the keep-alive to a quarter of it.
+    times the keep-alive (OPC 10000-4 v1.05, 5.14.2.2). `session_timeout` in milliseconds limits the keep-alive to a
+    quarter of it.
     :raises ValueError: for explicit counts whose lifetime is below three keep-alives
     """
     if session_timeout:
@@ -227,6 +226,11 @@ def subscription_parameters(
 
 
 class SubscriptionState(Enum):
+    """
+    The client's view of a Subscription: NEW before CreateSubscription, ACTIVE, SUSPENDED while the server shuts
+    down, LOST after a Bad_Timeout status change, TRANSFERRED to another session, DELETED.
+    """
+
     NEW = "new"
     ACTIVE = "active"
     SUSPENDED = "suspended"
@@ -241,23 +245,25 @@ WARNING_INTERVAL = 10.0
 
 
 def next_sequence_number(number: int) -> int:
+    """The SequenceNumber after number; it wraps from 4294967295 to 1 (OPC 10000-4 v1.05, 5.14.1.1)."""
     return 1 if number >= SEQUENCE_MASK else number + 1
 
 
 def sequence_distance(start: int, end: int) -> int:
+    """How many SequenceNumbers lie from start up to end, across the wrap."""
     return (end - start) & SEQUENCE_MASK
 
 
 def sequence_is_ahead(number: int, expected: int) -> bool:
+    """Whether number comes after expected, less than half the number space later."""
     return number != expected and sequence_distance(expected, number) < SEQUENCE_HALF
 
 
 class Subscription:
     """
-    Subscription object returned by Server or Client objects.
-    The object represent a subscription to an opc-ua server.
-    This is a high level class, especially `subscribe_data_change` and `subscribe_events methods`.
-    If more control is necessary look at code and/or use `create_monitored_items method`.
+    A Subscription of a Client or Server, made with create_subscription. Notifications go to the handler if one is
+    given, else to an async iterator (`async for event in subscription`). subscribe_data_change and
+    subscribe_events add MonitoredItems; create_monitored_items gives full control.
     :param server: the session the Subscription lives in: `UaSession` or `InternalSession`
     """
 
@@ -285,7 +291,7 @@ class Subscription:
         self.inbox_maxsize = inbox_maxsize
         self.max_republish = max_republish
         self.republish_missing = republish_missing
-        self.parameters: ua.CreateSubscriptionParameters = params  # move to data class
+        self.parameters: ua.CreateSubscriptionParameters = params
         self._monitored_items: dict[int, SubscriptionItemData] = {}
         self._recreate_count: int = 0
         self.subscription_id: int | None = None
@@ -343,13 +349,15 @@ class Subscription:
             self.logger.warning(message, *args)
 
     async def init(self) -> ua.CreateSubscriptionResult:
+        """CreateSubscription on the server; Client.create_subscription and Server.create_subscription call it."""
         return await self._create(SubscriptionEvent.CREATED)
 
     async def _create(self, event: SubscriptionEvent) -> ua.CreateSubscriptionResult:
-        response = await self.server.create_subscription(
-            self.parameters, callback=self if self._remote else self.publish_callback
-        )
-        self.subscription_id = response.SubscriptionId  # move to data class
+        if self._remote:
+            response = await cast("UaSession", self.server).create_subscription(self.parameters, callback=self)
+        else:
+            response = await self.server.create_subscription(self.parameters, callback=self.publish_callback)
+        self.subscription_id = response.SubscriptionId
         self._created_at = time.monotonic()
         self.last_publish_at = None
         self.state = SubscriptionState.ACTIVE
@@ -382,6 +390,7 @@ class Subscription:
         await self.update(params)
 
     async def update(self, params: ua.ModifySubscriptionParameters) -> ua.ModifySubscriptionResult:
+        """ModifySubscription (client only); a LifetimeCount below three keep-alive counts is raised to that."""
         session = self._remote_session("update")
         if params.RequestedLifetimeCount < 3 * params.RequestedMaxKeepAliveCount:
             params.RequestedLifetimeCount = 3 * params.RequestedMaxKeepAliveCount
@@ -404,8 +413,6 @@ class Subscription:
     def _acknowledge(self, sequence_number: int) -> None:
         if self._remote and self.subscription_id is not None:
             cast("UaSession", self.server).acknowledge(self.subscription_id, sequence_number)
-
-    # --- sink: called by the publish pipeline ---------------------------------
 
     async def publish_callback(self, publish_result: ua.PublishResult) -> None:
         """
@@ -440,6 +447,7 @@ class Subscription:
             self.logger.exception("enqueue failed")
 
     def session_event(self, status: ua.StatusCode) -> None:
+        """A status of the session, delivered like a StatusChangeNotification; Bad_Shutdown suspends."""
         if status.value == ua.StatusCodes.BadShutdown and self.state is SubscriptionState.ACTIVE:
             self.state = SubscriptionState.SUSPENDED
         message = ua.NotificationMessage(NotificationData=[ua.StatusChangeNotification(Status=status)])  # type: ignore[list-item]
@@ -653,8 +661,6 @@ class Subscription:
         except Exception:
             self.logger.exception("Exception calling subscription handler")
 
-    # --- async iterator / context-manager API ------------------------------
-
     async def __aenter__(self) -> Subscription:
         return self
 
@@ -749,10 +755,11 @@ class Subscription:
         if state is SubscriptionState.DELETED and previous is not SubscriptionState.DELETED:
             self._observe(lambda: self._observer.on_subscription_event(self.subscription_id, SubscriptionEvent.DELETED))
 
-    def _close_iterator(self) -> None:
-        self._put_event(None)
-
     def is_stale(self, margin: float) -> bool:
+        """
+        Whether no publish (data or keep-alive) arrived for margin times the keep-alive period; a LOST Subscription
+        is stale, a NEW, SUSPENDED or ended one is not.
+        """
         if self.subscription_id is None or self.state is SubscriptionState.SUSPENDED:
             return False
         if self.state is SubscriptionState.LOST:
@@ -776,6 +783,10 @@ class Subscription:
         self.last_sequence_number = None
 
     async def restore(self) -> None:
+        """
+        After a reconnect: move the Subscription to the new session with TransferSubscriptions and Republish what
+        was missed, or re-create it with its MonitoredItems when that fails.
+        """
         if self.state in (SubscriptionState.DELETED, SubscriptionState.TRANSFERRED):
             return
         if self.subscription_id is None or not self._remote:
@@ -794,7 +805,7 @@ class Subscription:
         result = results[0] if results else None
         available: list[int] = []
         if result is not None and result.StatusCode.value == ua.StatusCodes.BadNothingToDo:
-            available = []
+            pass
         elif result is None or not result.StatusCode.is_good():
             self.logger.info(
                 "transfer_subscriptions returned %s; falling back to recreate",
@@ -909,12 +920,11 @@ class Subscription:
         try:
             results = await self.server.create_monitored_items(params)
         except ServiceError as e:
-            raise ua.UaStatusCodeError(e.code)
+            raise ua.UaStatusCodeError(e.code) from e
         for idx, result in enumerate(results):
             mi = params.ItemsToCreate[idx]
-            assert mi.RequestedParameters.ClientHandle is not None
-            item = self._monitored_items.get(mi.RequestedParameters.ClientHandle)
-            if item is None:
+            restored = self._monitored_items.get(mi.RequestedParameters.ClientHandle)
+            if restored is None:
                 continue
             if not result.StatusCode.is_good():
                 self.logger.warning(
@@ -925,10 +935,10 @@ class Subscription:
                 self.failed_items.append((mi.RequestedParameters.ClientHandle, result.StatusCode))
                 del self._monitored_items[mi.RequestedParameters.ClientHandle]
                 continue
-            item.server_handle = result.MonitoredItemId
-            item.revised_sampling_interval = result.RevisedSamplingInterval
-            item.revised_queuesize = result.RevisedQueueSize
-            item.filter_result = result.FilterResult
+            restored.server_handle = result.MonitoredItemId
+            restored.revised_sampling_interval = result.RevisedSamplingInterval
+            restored.revised_queuesize = result.RevisedQueueSize
+            restored.filter_result = result.FilterResult
 
     @overload
     async def subscribe_data_change(
@@ -943,7 +953,7 @@ class Subscription:
     @overload
     async def subscribe_data_change(
         self,
-        nodes: Node | Iterable[Node],
+        nodes: Iterable[Node],
         attr: ua.AttributeIds = ua.AttributeIds.Value,
         queuesize: int = 0,
         monitoring: ua.MonitoringMode = ua.MonitoringMode.Reporting,
@@ -1012,7 +1022,9 @@ class Subscription:
         :param evfilter: ua.EventFilter which provides the SelectClauses and WhereClause
         :param queuesize: 0 for default queue size, 1 for minimum queue size, n for FIFO queue,
             MaxUInt32 for max queue size
-        :param where_clause_generation: No where_clause generation when no eventfilter is provided. Need for TwinCAT, Codesys
+        :param where_clause_generation: False builds the filter without a WhereClause, for servers such as TwinCAT
+            and Codesys that cannot evaluate one. For BaseEventType alone no WhereClause is sent anyway, since it
+            would let every Event through.
         :return: Handle for changing/cancelling of the subscription
         """
         sourcenode = Node(self.server, sourcenode)
@@ -1020,8 +1032,6 @@ class Subscription:
             if isinstance(evtypes, int | str | ua.NodeId | Node) and Node(self.server, evtypes).nodeid == ua.NodeId(
                 ua.ObjectIds.BaseEventType
             ):
-                # Remove where clause for base event type, for servers that have problems with long WhereClauses.
-                # Also because BaseEventType wants every event we can ommit it. Issue: #1205
                 where_clause_generation = False
             evfilter = await self._create_eventfilter(evtypes, where_clause_generation)
         return await self._subscribe(sourcenode, ua.AttributeIds.EventNotifier, evfilter, queuesize=queuesize)
@@ -1100,28 +1110,18 @@ class Subscription:
         :param sampling_interval: ua.Duration
         :return: Integer handle or if multiple Nodes were given a List of Integer handles/ua.StatusCode
         """
-        is_list = True
-        if isinstance(nodes, collections.abc.Iterable):
-            nodes = list(nodes)
-        else:
-            nodes = [nodes]
-            is_list = False
-        # Create List of MonitoredItemCreateRequest
-        mirs = []
-        for node in nodes:
-            mir = self._make_monitored_item_request(node, attr, mfilter, queuesize, monitoring, sampling_interval)
-            mirs.append(mir)
-        # Await MonitoredItemCreateResult
+        is_list = isinstance(nodes, collections.abc.Iterable)
+        node_list = list(nodes) if isinstance(nodes, collections.abc.Iterable) else [nodes]
+        mirs = [
+            self._make_monitored_item_request(node, attr, mfilter, queuesize, monitoring, sampling_interval)
+            for node in node_list
+        ]
         mids = await self.create_monitored_items(mirs)
         if is_list:
-            # Return results for multiple nodes
             return mids
-        # Check and return result for single node (raise `UaStatusCodeError` if subscription failed)
         first = mids[0]
         if isinstance(first, ua.StatusCode):
             first.check()
-            # check() raises for Bad codes; create_monitored_items only stores Bad codes
-            # here, so this fallthrough is unreachable. Guard for type-narrowing only.
             raise ua.uaerrors.UaError(f"Unexpected Good StatusCode in monitored-item failure path: {first}")
         return first
 
@@ -1137,14 +1137,13 @@ class Subscription:
         rv = ua.ReadValueId()
         rv.NodeId = node.nodeid
         rv.AttributeId = attr
-        # rv.IndexRange //We leave it null, then the entire array is returned
         mparams = ua.MonitoringParameters()
         self._client_handle += 1
         mparams.ClientHandle = self._client_handle
         mparams.SamplingInterval = sampling_interval
         mparams.QueueSize = queuesize
         mparams.DiscardOldest = True
-        if mfilter:
+        if mfilter is not None:
             mparams.Filter = mfilter
         mir = ua.MonitoredItemCreateRequest()
         mir.ItemToMonitor = rv
@@ -1156,8 +1155,9 @@ class Subscription:
         self, monitored_items: Iterable[ua.MonitoredItemCreateRequest]
     ) -> list[int | ua.StatusCode]:
         """
-        low level method to have full control over subscription parameters.
-        Client handle must be unique since it will be used as key for internal registration of data.
+        CreateMonitoredItems with requests made by the caller. Returns per request the MonitoredItemId, the handle
+        for unsubscribe, or the Bad StatusCode. The ClientHandles must be unique within the Subscription, since
+        notifications are matched to the items by them.
         """
         monitored_items = list(monitored_items)
         recreate_count = self._recreate_count
@@ -1165,8 +1165,6 @@ class Subscription:
         params.SubscriptionId = self.subscription_id
         params.ItemsToCreate = monitored_items
         params.TimestampsToReturn = ua.TimestampsToReturn.Both
-        # insert monitored item into map to avoid notification arrive before result return
-        # server_handle is left as None in purpose as we don't get it yet.
         for mi in monitored_items:
             data = SubscriptionItemData()
             data.client_handle = mi.RequestedParameters.ClientHandle
@@ -1183,7 +1181,7 @@ class Subscription:
             results = await self.server.create_monitored_items(params)
         except ServiceError as e:
             self._forget_monitored_items(params.ItemsToCreate, recreate_count)
-            raise ua.UaStatusCodeError(e.code)
+            raise ua.UaStatusCodeError(e.code) from e
         except Exception:
             self._forget_monitored_items(params.ItemsToCreate, recreate_count)
             raise
@@ -1191,8 +1189,7 @@ class Subscription:
         if recreate_count != self._recreate_count:
             self._forget_monitored_items(params.ItemsToCreate, recreate_count)
             raise ua.UaStatusCodeError(ua.StatusCodes.BadSubscriptionIdInvalid)
-        mids = []
-        # process result, add server_handle, or remove it if failed
+        mids: list[int | ua.StatusCode] = []
         for idx, result in enumerate(results):
             mi = params.ItemsToCreate[idx]
             if not result.StatusCode.is_good():
@@ -1235,7 +1232,7 @@ class Subscription:
         try:
             results = await self.server.delete_monitored_items(params)
         except ServiceError as e:
-            raise ua.UaStatusCodeError(e.code)
+            raise ua.UaStatusCodeError(e.code) from e
         failed: list[tuple[int, ua.StatusCode]] = []
         for h, status in zip(handles, results):
             if status.is_good() or status.value == ua.StatusCodes.BadMonitoredItemIdInvalid:
@@ -1253,7 +1250,7 @@ class Subscription:
         handle: int,
         new_samp_time: ua.Duration | None = None,
         new_queuesize: int | None = None,
-        mod_filter_val: int | None = -1,
+        mod_filter_val: float | None = -1,
     ) -> list[ua.MonitoredItemModifyResult]:
         """
         Modify a monitored item. Parameters that are not given keep the values the item was created with.
@@ -1264,7 +1261,7 @@ class Subscription:
         :return: Return a Modify Monitored Item Result
         """
         item = next((i for i in self._monitored_items.values() if i.server_handle == handle), None)
-        if item is None:
+        if item is None or item.client_handle is None:
             raise ValueError("The monitored item was not found.")
         mod_filter: ua.MonitoringFilter | ua.EventFilter | None
         if isinstance(item.mfilter, ua.EventFilter) or (mod_filter_val is not None and mod_filter_val < 0):
@@ -1273,8 +1270,8 @@ class Subscription:
             mod_filter = None
         else:
             mod_filter = ua.DataChangeFilter()
-            mod_filter.Trigger = ua.DataChangeTrigger(1)
-            mod_filter.DeadbandType = 1
+            mod_filter.Trigger = ua.DataChangeTrigger.StatusValue
+            mod_filter.DeadbandType = ua.DeadbandType.Absolute
             mod_filter.DeadbandValue = mod_filter_val
         sampling_interval = item.sampling_interval if new_samp_time is None else new_samp_time
         queuesize = item.queuesize if new_queuesize is None else new_queuesize
@@ -1290,7 +1287,7 @@ class Subscription:
         try:
             results = await self.server.modify_monitored_items(params)
         except ServiceError as e:
-            raise ua.UaStatusCodeError(e.code)
+            raise ua.UaStatusCodeError(e.code) from e
         result = results[0]
         result.StatusCode.check()
         item.sampling_interval = sampling_interval
@@ -1346,30 +1343,26 @@ class Subscription:
         attr: ua.AttributeIds = ua.AttributeIds.Value,
     ) -> int | list[int | ua.StatusCode]:
         """
-        Method to create a subscription with a Deadband Value.
-        Default deadband value type is absolute.
-        Return a handle which can be used to unsubscribe
+        Subscribe to data changes beyond a deadband, reported on a change of status or value (OPC 10000-4 v1.05,
+        7.22.2). Returns the handle, or for several Variables a list of handles and Bad StatusCodes.
         :param var: Variable to which you want to subscribe
-        :param deadband_val: Absolute float value
-        :param deadbandtype: Default value is 1 (absolute), change to 2 for percentage deadband
+        :param deadband_val: the deadband: an absolute value, or 0 to 100 for a percent deadband
+        :param deadbandtype: ua.DeadbandType.Absolute (1, the default) or ua.DeadbandType.Percent (2)
         :param queuesize: Wanted queue size, 0 or 1 for the server default (1 for data items)
         :param attr: Attribute ID
         """
         deadband_filter = ua.DataChangeFilter()
-        # send notification when status or value change
-        deadband_filter.Trigger = ua.DataChangeTrigger(1)
+        deadband_filter.Trigger = ua.DataChangeTrigger.StatusValue
         deadband_filter.DeadbandType = deadbandtype
-        # absolute float value or from 0 to 100 for percentage deadband
         deadband_filter.DeadbandValue = deadband_val
         return await self._subscribe(var, attr, deadband_filter, queuesize)
 
     async def set_monitoring_mode(
         self, monitoring: ua.MonitoringMode, handles: int | Iterable[int] | None = None
-    ) -> list[ua.uatypes.StatusCode]:
+    ) -> list[ua.StatusCode]:
         """
-        The monitoring mode parameter is used
-        to enable/disable the sampling of MonitoredItems
-        (Samples don't queue on the server side)
+        SetMonitoringMode (client only): Disabled stops sampling, Sampling samples without reporting and Reporting
+        samples and reports (OPC 10000-4 v1.05, 5.13.4).
 
         :param monitoring: The monitoring mode to apply
         :param handles: Handles of the items to change, default all items
@@ -1394,16 +1387,14 @@ class Subscription:
                 item.monitoring_mode = monitoring
         return results
 
-    async def set_publishing_mode(self, publishing: bool) -> list[ua.uatypes.StatusCode]:
+    async def set_publishing_mode(self, publishing: bool) -> list[ua.StatusCode]:
         """
-        Disable publishing of NotificationMessages for the subscription,
-        but doesn't discontinue the sending of keep-alive Messages,
-        nor change the monitoring mode.
+        SetPublishingMode (client only): with publishing False the server sends only keep-alives; the monitoring
+        modes do not change.
 
         :param publishing: The publishing mode to apply
         :return: Return a Set Publishing Mode Result
         """
-        self.logger.info("set_publishing_mode")
         session = self._remote_session("set_publishing_mode")
         if self.subscription_id is None:
             raise ua.uaerrors.UaError("set_publishing_mode() called before subscription was created on the server.")
