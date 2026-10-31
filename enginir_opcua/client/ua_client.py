@@ -5,8 +5,8 @@ Low level binary client.
 
 - transport: socket and secure channel via `UASocketProtocol`,
 - sessionless services (Discovery, Register/Unregister Server),
-- a default `UaSession` accessible via `session`, plus back-compat delegating
-  methods so code that used to call session services on `UaClient` keeps working.
+- reverse connect (`ReverseConnectListener`),
+- a default `UaSession` accessible via `session`, with the session services also callable on `UaClient`.
 """
 
 from __future__ import annotations
@@ -61,6 +61,8 @@ def _timeout(timeout: float | None) -> dict[str, float]:
 
 
 class UaClientState(Enum):
+    """The connection state of a UaClient; RECONNECTING lasts until the supervisor succeeds or gives up."""
+
     DISCONNECTED = "disconnected"
     CONNECTING = "connecting"
     SOCKET_OPEN = "socket_open"
@@ -71,6 +73,8 @@ class UaClientState(Enum):
 
 
 class UASocketState(Enum):
+    """The state of the socket of a UASocketProtocol."""
+
     INITIALIZED = "initialized"
     OPEN = "open"
     CLOSED = "closed"
@@ -85,12 +89,13 @@ class UASocketProtocol(asyncio.Protocol):
     def __init__(
         self,
         timeout: float = 1,
-        security_policy: security_policies.SecurityPolicy = security_policies.SecurityPolicyNone(),
+        security_policy: security_policies.SecurityPolicy | None = None,
         limits: TransportLimits | None = None,
     ) -> None:
         """
         :param timeout: Timeout in seconds
-        :param security_policy: Security policy (optional)
+        :param security_policy: Security policy, by default a new SecurityPolicyNone
+        :param limits: the transport limits, copied because the Hello exchange changes them
         """
         self.logger = logging.getLogger(f"{__name__}.UASocketProtocol")
         self.transport: asyncio.Transport | None = None
@@ -100,11 +105,8 @@ class UASocketProtocol(asyncio.Protocol):
         self._request_handle = 0
         self._callbackmap: dict[int, asyncio.Future[Any]] = {}
         self._abandoned_requests: dict[int, None] = {}
-        if limits is None:
-            limits = TransportLimits()
-        else:
-            limits = copy.deepcopy(limits)  # Make a copy because the limits can change in the session
-        self._channel = SecureChannel(security_policy, limits)
+        limits = TransportLimits() if limits is None else copy.deepcopy(limits)
+        self._channel = SecureChannel(security_policy or security_policies.SecurityPolicyNone(), limits)
         self._channel.peer_certificate_check = self._check_server_certificate
         self.certificate_validator: CertificateValidator | None = None
         self.validation_host_name: str | None = None
@@ -113,19 +115,15 @@ class UASocketProtocol(asyncio.Protocol):
         self._reader = FrameReader(lambda: self._channel.limits.max_recv_buffer)
 
         self.state: UASocketState = UASocketState.INITIALIZED
-        # needed to pass params from asynchronous request to synchronous data receive callback, as well as
-        # passing back the processed response to the request so that it can return it.
         self._open_secure_channel_exchange: ua.OpenSecureChannelResponse | ua.OpenSecureChannelParameters | None = None
         self.pre_request_hook: Callable[[], Awaitable[None]] | None = None
-        # Synchronous callback fired from connection_lost — used by the supervisor to detect transport loss.
         self.on_connection_lost: Callable[[Exception | None], None] | None = None
         self._types: ua.TypeRegistry | None = None
-        # Predicate telling whether the owning session is closing, so late responses
-        # to cancelled requests are logged as expected teardown rather than warnings.
         self.is_session_closing: Callable[[], bool] | None = None
 
     @property
     def types(self) -> ua.TypeRegistry | None:
+        """The type registry that decodes the ExtensionObjects of this connection."""
         return self._types
 
     @types.setter
@@ -208,8 +206,8 @@ class UASocketProtocol(asyncio.Protocol):
 
     def _process_received_message(self, msg: ReceivedMessage) -> None:
         if msg is None:
-            pass
-        elif isinstance(msg, ua.Message):
+            return
+        if isinstance(msg, ua.Message):
             self._call_callback(msg.request_id(), msg.body())
         elif isinstance(msg, AbortedMessage):
             self._fail_request(msg)
@@ -262,8 +260,6 @@ class UASocketProtocol(asyncio.Protocol):
                 self.transport.write(e.written)
             raise
         except Exception:
-            # reset request handle if any error
-            # see self._setup_request_header
             self._request_handle -= 1
             raise
         self._request_id = next_request_id
@@ -280,21 +276,17 @@ class UASocketProtocol(asyncio.Protocol):
         timeout_hint: float | None = None,
     ) -> Buffer:
         """
-        Send a request to the server.
-        Timeout is the time to wait for the answer and the timeout written in ua header, unless timeout_hint is given.
-        Returns response object if no callback is provided.
+        Send a request to the server and return the body of the response, after raising for a ServiceFault.
+        Timeout is the time to wait for the answer and the timeout written in ua header, unless timeout_hint is given;
+        0 waits without limit. The pre_request_hook runs first, so a reconnecting client waits or fails at once.
         """
         timeout = self.timeout if timeout is None else timeout
         if self.pre_request_hook:
-            # This will propagate exceptions from background tasks to the library user before calling a request which will
-            # time out then.
             await self.pre_request_hook()
         try:
             pending = self._send_request(request, timeout, message_type, timeout_hint)
             data = await self._wait_for_response(pending, self._request_id, timeout if timeout else None)
-        except UaError:
-            raise
-        except TimeoutError:
+        except (UaError, TimeoutError):
             raise
         except Exception as ex:
             if self.state is not UASocketState.OPEN:
@@ -320,6 +312,7 @@ class UASocketProtocol(asyncio.Protocol):
             del self._abandoned_requests[next(iter(self._abandoned_requests))]
 
     def check_answer(self, data: Buffer, context: str) -> bool:
+        """Raise the ServiceResult of a ServiceFault; True for any other response. The buffer is not consumed."""
         data = data.copy()
         typeid = nodeid_from_binary(data)
         if typeid == ua.FourByteNodeId(ua.ObjectIds.ServiceFault_Encoding_DefaultBinary):
@@ -372,9 +365,11 @@ class UASocketProtocol(asyncio.Protocol):
 
     @property
     def is_closed(self) -> bool:
+        """Whether the socket was closed."""
         return self.state is UASocketState.CLOSED
 
     def disconnect_socket(self) -> None:
+        """Close the socket; pending requests fail when the transport reports the loss."""
         self.logger.info("Request to close socket received")
         if self.transport:
             self.transport.close()
@@ -382,6 +377,9 @@ class UASocketProtocol(asyncio.Protocol):
             self.logger.warning("disconnect_socket was called but transport is None")
 
     async def send_hello(self, url: str, max_messagesize: int = 0, max_chunkcount: int = 0) -> ua.Acknowledge:
+        """Send Hello with this side's limits (0 keeps the default) and return the server's Acknowledge."""
+        if self.transport is None:
+            raise ConnectionError("Connection is not open")
         limits = self._channel.limits
         if max_messagesize:
             limits.max_message_size = max_messagesize
@@ -390,13 +388,13 @@ class UASocketProtocol(asyncio.Protocol):
         hello = limits.create_hello_limits(ua.Hello(EndpointUrl=url))
         ack: asyncio.Future[ua.Acknowledge] = asyncio.Future()
         self._callbackmap[0] = ack
-        if self.transport is not None:
-            self.transport.write(uatcp_to_binary(ua.MessageType.Hello, hello))
+        self.transport.write(uatcp_to_binary(ua.MessageType.Hello, hello))
         acknowledge = await wait_for(ack, self.timeout)
         self._acknowledged_version = acknowledge.ProtocolVersion
         return acknowledge
 
     async def open_secure_channel(self, params: ua.OpenSecureChannelParameters) -> OpenSecureChannelResult:
+        """Send OpenSecureChannel (Issue or Renew) and return the checked result; the channel takes its token."""
         self.logger.info("open_secure_channel")
         request = ua.OpenSecureChannelRequest()
         request.Parameters = params
@@ -426,8 +424,6 @@ class UASocketProtocol(asyncio.Protocol):
         request = ua.CloseSecureChannelRequest()
         future = self._send_request(request, message_type=ua.MessageType.SecureClose)
         future.cancel()
-        # Fail any in-flight RPC futures with ConnectionError so awaiters can clean up,
-        # rather than leaving them as silently cancelled.
         for pending in self._callbackmap.values():
             if not pending.done():
                 pending.set_exception(ConnectionError("Secure channel closed"))
@@ -435,6 +431,7 @@ class UASocketProtocol(asyncio.Protocol):
 
 
 def normalize_endpoint_url(url: str) -> str:
+    """The URL with scheme and host in lower case and the port explicit, to compare endpoint URLs."""
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     return f"{parsed.scheme.lower()}://{host}:{parsed.port or 4840}{parsed.path}"
@@ -523,6 +520,7 @@ class ReverseTarget:
         self._waiter: asyncio.Future[_ReverseAcceptor] | None = None
 
     def offer(self, acceptor: _ReverseAcceptor) -> bool:
+        """Hand a checked socket to the waiting client, or park it; False if the listener cannot keep it."""
         if self._waiter is not None and not self._waiter.done():
             self._waiter.set_result(acceptor)
             return True
@@ -574,6 +572,7 @@ class ReverseConnectListener:
         self._acceptors: set[_ReverseAcceptor] = set()
 
     def target(self, server_uri: str, endpoint_url: str) -> ReverseTarget:
+        """The target for this server, created on first use; a client waits on it with ReverseTarget.accept."""
         endpoint = normalize_endpoint_url(endpoint_url)
         for existing in self._targets:
             if existing.server_uri == server_uri and existing.endpoint_url == endpoint:
@@ -602,6 +601,7 @@ class ReverseConnectListener:
         return self._server is not None
 
     async def start(self) -> None:
+        """Start listening; with port 0 the port the system picks is stored in port."""
         if self._server is not None:
             return
         self._server = await asyncio.get_running_loop().create_server(self._make_acceptor, self.host, self.port)
@@ -609,6 +609,7 @@ class ReverseConnectListener:
             self.port = self._server.sockets[0].getsockname()[1]
 
     async def stop(self) -> None:
+        """Stop listening and close every socket the listener still holds."""
         server, self._server = self._server, None
         if server is not None:
             server.close()
@@ -684,8 +685,8 @@ class UaClient:
 
     Owns the transport (`UASocketProtocol`) and a default `UaSession`.
     Sessionless services (Discovery, Register/Unregister Server) live here.
-    Session-scoped service calls delegate to `self.session` for back-compat
-    with code that used to call them on `UaClient` directly.
+    The session services (browse, read, write, call, create_subscription, ...) are those of `self.session` and take
+    an optional timeout in seconds; their documentation is in `common.session_interface.AbstractSession`.
     """
 
     _max_concurrent_requests = 100
@@ -713,6 +714,7 @@ class UaClient:
 
     @property
     def state(self) -> UaClientState:
+        """The connection state."""
         return self._state
 
     @property
@@ -742,7 +744,6 @@ class UaClient:
             return
         self._state = target
         self._observe(lambda: self.observer.on_state_change(target))
-        # Iterate a copy so listeners can safely unsubscribe themselves.
         for listener in list(self._state_listeners):
             try:
                 listener(target)
@@ -767,6 +768,7 @@ class UaClient:
         return unsubscribe
 
     def remove_state_listener(self, callback: Callable[[UaClientState], None]) -> None:
+        """Remove a callback added with add_state_listener; an unknown one is ignored."""
         try:
             self._state_listeners.remove(callback)
         except ValueError:
@@ -810,6 +812,7 @@ class UaClient:
         self._set_state(UaClientState.RECONNECTING)
 
     def complete_reconnect(self) -> None:
+        """End RECONNECTING: the supervisor reconnected."""
         self._reconnect_hold = False
         self._set_state(UaClientState.CONNECTED)
 
@@ -828,12 +831,8 @@ class UaClient:
         """True when a server-side session exists that ActivateSession could reuse."""
         return self.session.has_session
 
-    def ensure_publish_loop(self) -> None:
-        self.session.ensure_publish_loop()
-
-    # --- transport helpers ---
-
     def set_security(self, policy: security_policies.SecurityPolicy) -> None:
+        """The security policy of the next connection."""
         self.security_policy = policy
 
     def set_max_concurrent_requests(self, max_concurrent_requests: int) -> None:
@@ -856,6 +855,7 @@ class UaClient:
 
     @property
     def pre_request_hook(self) -> Callable[[], Awaitable[None]] | None:
+        """Awaited before every request; Client uses it to hold requests during a reconnect."""
         return self._pre_request_hook
 
     @pre_request_hook.setter
@@ -889,10 +889,10 @@ class UaClient:
         self._set_state(UaClientState.SOCKET_OPEN)
 
     def disconnect_socket(self) -> None:
+        """Close the socket and move to DISCONNECTED."""
         if self._state is UaClientState.DISCONNECTED:
             return
         if self._state is UaClientState.DISCONNECTING:
-            # already tearing down; let the in-flight call complete
             return
         self._set_state(UaClientState.DISCONNECTING)
         if self.protocol is not None and self.protocol.state is not UASocketState.CLOSED:
@@ -901,11 +901,13 @@ class UaClient:
         self._set_state(UaClientState.DISCONNECTED)
 
     async def send_hello(self, url: str, max_messagesize: int = 0, max_chunkcount: int = 0) -> ua.Acknowledge:
+        """Send Hello; see UASocketProtocol.send_hello."""
         if self.protocol is None:
             raise ConnectionError("Connection is not open")
         return await self.protocol.send_hello(url, max_messagesize, max_chunkcount)
 
     async def open_secure_channel(self, params: ua.OpenSecureChannelParameters) -> OpenSecureChannelResult:
+        """Open or renew the secure channel; an Issue moves the state to CHANNEL_OPEN."""
         if self.protocol is None:
             raise ConnectionError("Connection is not open")
         is_renew = params.RequestType == ua.SecurityTokenRequestType.Renew
@@ -915,6 +917,7 @@ class UaClient:
         return result
 
     async def close_secure_channel(self) -> None:
+        """Send CloseSecureChannel if the socket is open."""
         if not self.protocol or self.protocol.state is UASocketState.CLOSED:
             self.logger.warning("close_secure_channel was called but connection is closed")
             return
@@ -946,37 +949,25 @@ class UaClient:
             return await self.protocol.send_request(request, timeout, message_type)
         return await self.protocol.send_request(request, timeout, message_type, timeout_hint)
 
-    # --- back-compat: properties that previously lived on UaClient ---
-
-    @property
-    def _subscription_callbacks(self) -> dict[int, Callable[..., Any]]:
-        return self.session._subscription_callbacks
-
-    @property
-    def _publish_task(self) -> asyncio.Task[None] | None:
-        return self.session._publish_task
-
-    # --- session lifecycle: delegate to default session ---
-
     async def create_session(self, parameters: ua.CreateSessionParameters) -> ua.CreateSessionResult:
+        """CreateSession; the session keeps the AuthenticationToken."""
         return await self.session.create_session(parameters)
 
     async def activate_session(self, parameters: ua.ActivateSessionParameters) -> ua.ActivateSessionResult:
+        """ActivateSession; the first activation moves the state to CONNECTED."""
         result = await self.session.activate_session(parameters)
-        # Only transition on the first activation; re-activate of an already-ACTIVATED
-        # session leaves UaClient in CONNECTED.
         if self._state is UaClientState.CHANNEL_OPEN:
             self._set_state(UaClientState.CONNECTED)
         return result
 
     async def close_session(self, delete_subscriptions: bool) -> None:
+        """CloseSession, stopping the Publish requests first."""
         await self.session.close_session(delete_subscriptions)
         if self._state is UaClientState.CONNECTED:
             self._set_state(UaClientState.CHANNEL_OPEN)
 
-    # --- sessionless services ---
-
     async def get_endpoints(self, params: ua.GetEndpointsParameters) -> list[ua.EndpointDescription]:
+        """GetEndpoints (OPC 10000-4 v1.05, 5.5.4); needs no session."""
         self.logger.debug("get_endpoint")
         request = ua.GetEndpointsRequest()
         request.Parameters = params
@@ -987,6 +978,7 @@ class UaClient:
         return response.Endpoints
 
     async def find_servers(self, params: ua.FindServersParameters) -> list[ua.ApplicationDescription]:
+        """FindServers (OPC 10000-4 v1.05, 5.5.2); needs no session."""
         self.logger.debug("find_servers")
         request = ua.FindServersRequest()
         request.Parameters = params
@@ -997,6 +989,7 @@ class UaClient:
         return response.Servers
 
     async def find_servers_on_network(self, params: ua.FindServersOnNetworkParameters) -> ua.FindServersOnNetworkResult:
+        """FindServersOnNetwork (OPC 10000-4 v1.05, 5.5.3); needs no session."""
         self.logger.debug("find_servers_on_network")
         request = ua.FindServersOnNetworkRequest()
         request.Parameters = params
@@ -1007,6 +1000,7 @@ class UaClient:
         return response.Parameters
 
     async def register_server(self, registered_server: ua.RegisteredServer) -> None:
+        """RegisterServer (OPC 10000-4 v1.05, 5.5.5) with a discovery server."""
         self.logger.debug("register_server")
         request = ua.RegisterServerRequest()
         request.Server = registered_server
@@ -1017,15 +1011,10 @@ class UaClient:
 
     async def unregister_server(self, registered_server: ua.RegisteredServer) -> None:
         """Same request as register_server; the caller's RegisteredServer.IsOnline = False makes it an unregistration."""
-        self.logger.debug("unregister_server")
-        request = ua.RegisterServerRequest()
-        request.Server = registered_server
-        data = await self._send_request(request)
-        response = struct_from_binary(ua.RegisterServerResponse, data)
-        self.logger.debug(response)
-        response.ResponseHeader.ServiceResult.check()
+        await self.register_server(registered_server)
 
     async def register_server2(self, params: ua.RegisterServer2Parameters) -> list[ua.StatusCode]:
+        """RegisterServer2 (OPC 10000-4 v1.05, 5.5.6); returns the result of each discovery configuration."""
         self.logger.debug("register_server2")
         request = ua.RegisterServer2Request()
         request.Parameters = params
@@ -1037,16 +1026,7 @@ class UaClient:
 
     async def unregister_server2(self, params: ua.RegisterServer2Parameters) -> list[ua.StatusCode]:
         """Same request as register_server2; the caller's RegisteredServer.IsOnline = False makes it an unregistration."""
-        self.logger.debug("unregister_server2")
-        request = ua.RegisterServer2Request()
-        request.Parameters = params
-        data = await self._send_request(request)
-        response = struct_from_binary(ua.RegisterServer2Response, data)
-        self.logger.debug(response)
-        response.ResponseHeader.ServiceResult.check()
-        return response.ConfigurationResults
-
-    # --- AbstractSession: delegate to default session ---
+        return await self.register_server2(params)
 
     async def browse(self, parameters: ua.BrowseParameters, timeout: float | None = None) -> list[ua.BrowseResult]:
         return await self.session.browse(parameters, **_timeout(timeout))
@@ -1133,8 +1113,6 @@ class UaClient:
     ) -> ua.ModifySubscriptionResult:
         return await self.session.update_subscription(params, **_timeout(timeout))
 
-    modify_subscription = update_subscription  # legacy support
-
     async def delete_subscriptions(
         self, subscription_ids: list[int], timeout: float | None = None
     ) -> list[ua.StatusCode]:
@@ -1172,10 +1150,10 @@ class UaClient:
 
     async def set_monitoring_mode(
         self, params: ua.SetMonitoringModeParameters, timeout: float | None = None
-    ) -> list[ua.uatypes.StatusCode]:
+    ) -> list[ua.StatusCode]:
         return await self.session.set_monitoring_mode(params, **_timeout(timeout))
 
     async def set_publishing_mode(
         self, params: ua.SetPublishingModeParameters, timeout: float | None = None
-    ) -> list[ua.uatypes.StatusCode]:
+    ) -> list[ua.StatusCode]:
         return await self.session.set_publishing_mode(params, **_timeout(timeout))

@@ -9,6 +9,7 @@ defined in `AbstractSession`. It uses a `UaClient` only as a transport.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import math
 import time
@@ -64,15 +65,20 @@ ROUND_TRIP_REQUESTS = (
 
 
 def check_result_count(requested: int, received: int) -> None:
+    """Raise UaError when a response holds another number of results than the request had items."""
     if requested != received:
         raise ua.UaError(f"The server answered {received} results for {requested} request items")
 
 
 class Sink(Protocol):
+    """What receives the PublishResults of one Subscription; Subscription is one."""
+
     def enqueue(self, result: ua.PublishResult) -> None: ...
 
 
 class SinkMap(dict[int, Any]):
+    """The sinks by SubscriptionId; every change is reported, with the ids that were removed."""
+
     def __init__(self, changed: Callable[[Iterable[int]], None]) -> None:
         super().__init__()
         self._changed = changed
@@ -99,6 +105,8 @@ class SinkMap(dict[int, Any]):
 
 
 class SessionState(Enum):
+    """The state of the session of a UaSession."""
+
     NEW = "new"
     CREATING = "creating"
     CREATED = "created"
@@ -140,10 +148,12 @@ class UaSession(AbstractSession):
 
     @property
     def observer(self) -> Observer:
+        """The observer of the UaClient."""
         return self._client.observer
 
     @property
     def state(self) -> SessionState:
+        """The state of the session."""
         return self._state
 
     def _set_state(self, target: SessionState) -> None:
@@ -190,6 +200,7 @@ class UaSession(AbstractSession):
             self._round_trip += ROUND_TRIP_WEIGHT * (seconds - self._round_trip)
 
     async def create_session(self, parameters: ua.CreateSessionParameters) -> ua.CreateSessionResult:
+        """CreateSession (OPC 10000-4 v1.05, 5.7.2); the AuthenticationToken goes into every later request."""
         if self._client.protocol is None:
             raise ConnectionError("Connection is not open")
         self.logger.info("create_session")
@@ -211,6 +222,7 @@ class UaSession(AbstractSession):
         return response.Parameters
 
     async def activate_session(self, parameters: ua.ActivateSessionParameters) -> ua.ActivateSessionResult:
+        """ActivateSession (OPC 10000-4 v1.05, 5.7.3); on failure the session keeps its previous state."""
         self.logger.info("activate_session")
         previous_state = self._state
         self._set_state(SessionState.ACTIVATING)
@@ -222,13 +234,16 @@ class UaSession(AbstractSession):
             self.logger.debug(response)
             response.ResponseHeader.ServiceResult.check()
         except BaseException:
-            # Roll back to whichever state we were in (CREATED or ACTIVATED)
             self._state = previous_state
             raise
         self._set_state(SessionState.ACTIVATED)
         return response.Parameters
 
     async def close_session(self, delete_subscriptions: bool) -> None:
+        """
+        CloseSession (OPC 10000-4 v1.05, 5.7.4) after stopping the Publish requests; Bad_SessionClosed and
+        Bad_UserAccessDenied (older servers refuse to close a session that was never activated) count as closed.
+        """
         self.logger.info("close_session")
         if self._state in (SessionState.CLOSED, SessionState.CLOSING):
             return
@@ -259,20 +274,15 @@ class UaSession(AbstractSession):
             response = struct_from_binary(ua.CloseSessionResponse, data)
             try:
                 response.ResponseHeader.ServiceResult.check()
-            except BadSessionClosed:
-                # Closing the session with open publish requests leads to BadSessionClosed responses;
-                # ignore it.
-                pass
-            except BadUserAccessDenied:
-                # Older versions of enginir_opcua didn't allow closing non-activated sessions; ignore it.
-                pass
+            except (BadSessionClosed, BadUserAccessDenied):
+                self.logger.debug(
+                    "CloseSession answered %s; the session is gone", response.ResponseHeader.ServiceResult
+                )
         finally:
             self._set_state(SessionState.CLOSED)
 
-    # --- View Service Set ---
-
     async def browse(self, parameters: ua.BrowseParameters, timeout: float | None = None) -> list[ua.BrowseResult]:
-        self.logger.info("browse")
+        self.logger.debug("browse")
         request = ua.BrowseRequest()
         request.Parameters = parameters
         data = await self._send_request(request, timeout)
@@ -306,7 +316,7 @@ class UaSession(AbstractSession):
         return response.Results
 
     async def register_nodes(self, nodes: list[ua.NodeId], timeout: float | None = None) -> list[ua.NodeId]:
-        self.logger.info("register_nodes")
+        self.logger.debug("register_nodes")
         request = ua.RegisterNodesRequest()
         request.Parameters.NodesToRegister = nodes
         data = await self._send_request(request, timeout)
@@ -316,15 +326,13 @@ class UaSession(AbstractSession):
         return response.Parameters.RegisteredNodeIds
 
     async def unregister_nodes(self, nodes: list[ua.NodeId], timeout: float | None = None) -> None:
-        self.logger.info("unregister_nodes")
+        self.logger.debug("unregister_nodes")
         request = ua.UnregisterNodesRequest()
         request.Parameters.NodesToUnregister = nodes
         data = await self._send_request(request, timeout)
         response = struct_from_binary(ua.UnregisterNodesResponse, data)
         self.logger.debug(response)
         response.ResponseHeader.ServiceResult.check()
-
-    # --- Attribute Service Set ---
 
     async def read(self, parameters: ua.ReadParameters, timeout: float | None = None) -> list[ua.DataValue]:
         self.logger.debug("read")
@@ -349,7 +357,7 @@ class UaSession(AbstractSession):
     async def history_read(
         self, params: ua.HistoryReadParameters, timeout: float | None = None
     ) -> list[ua.HistoryReadResult]:
-        self.logger.info("history_read")
+        self.logger.debug("history_read")
         request = ua.HistoryReadRequest()
         request.Parameters = params
         data = await self._send_request(request, timeout)
@@ -361,7 +369,7 @@ class UaSession(AbstractSession):
     async def history_update(
         self, params: ua.HistoryUpdateParameters, timeout: float | None = None
     ) -> list[ua.HistoryUpdateResult]:
-        self.logger.info("history_update")
+        self.logger.debug("history_update")
         request = ua.HistoryUpdateRequest()
         request.Parameters = params
         data = await self._send_request(request, timeout)
@@ -373,7 +381,8 @@ class UaSession(AbstractSession):
     async def read_attributes(
         self, nodeids: list[ua.NodeId], attr: ua.AttributeIds, timeout: float | None = None
     ) -> list[ua.DataValue]:
-        self.logger.info("read_attributes of several nodes")
+        """Read one attribute of several nodes in one request."""
+        self.logger.debug("read_attributes of several nodes")
         request = ua.ReadRequest()
         for nodeid in nodeids:
             rv = ua.ReadValueId()
@@ -393,7 +402,8 @@ class UaSession(AbstractSession):
         attributeid: ua.AttributeIds = ua.AttributeIds.Value,
         timeout: float | None = None,
     ) -> list[ua.StatusCode]:
-        self.logger.info("write_attributes of several nodes")
+        """Write one attribute of several nodes in one request; nodeids and datavalues pair up."""
+        self.logger.debug("write_attributes of several nodes")
         request = ua.WriteRequest()
         nodeids = list(nodeids)
         datavalues = list(datavalues)
@@ -411,12 +421,10 @@ class UaSession(AbstractSession):
         check_result_count(len(nodeids), len(response.Results))
         return response.Results
 
-    # --- NodeManagement Service Set ---
-
     async def add_nodes(
         self, nodestoadd: list[ua.AddNodesItem], timeout: float | None = None
     ) -> list[ua.AddNodesResult]:
-        self.logger.info("add_nodes")
+        self.logger.debug("add_nodes")
         request = ua.AddNodesRequest()
         request.Parameters.NodesToAdd = nodestoadd
         data = await self._send_request(request, timeout)
@@ -428,7 +436,7 @@ class UaSession(AbstractSession):
     async def add_references(
         self, refs: list[ua.AddReferencesItem], timeout: float | None = None
     ) -> list[ua.StatusCode]:
-        self.logger.info("add_references")
+        self.logger.debug("add_references")
         request = ua.AddReferencesRequest()
         request.Parameters.ReferencesToAdd = refs
         data = await self._send_request(request, timeout)
@@ -440,7 +448,7 @@ class UaSession(AbstractSession):
     async def delete_references(
         self, refs: list[ua.DeleteReferencesItem], timeout: float | None = None
     ) -> list[ua.StatusCode]:
-        self.logger.info("delete")
+        self.logger.debug("delete_references")
         request = ua.DeleteReferencesRequest()
         request.Parameters.ReferencesToDelete = refs
         data = await self._send_request(request, timeout)
@@ -450,7 +458,7 @@ class UaSession(AbstractSession):
         return response.Parameters.Results
 
     async def delete_nodes(self, params: ua.DeleteNodesParameters, timeout: float | None = None) -> list[ua.StatusCode]:
-        self.logger.info("delete_nodes")
+        self.logger.debug("delete_nodes")
         request = ua.DeleteNodesRequest()
         request.Parameters = params
         data = await self._send_request(request, timeout)
@@ -458,8 +466,6 @@ class UaSession(AbstractSession):
         self.logger.debug(response)
         response.ResponseHeader.ServiceResult.check()
         return response.Results
-
-    # --- Method Service Set ---
 
     async def call(
         self, methodstocall: list[ua.CallMethodRequest], timeout: float | None = None
@@ -471,8 +477,6 @@ class UaSession(AbstractSession):
         self.logger.debug(response)
         response.ResponseHeader.ServiceResult.check()
         return response.Results
-
-    # --- Subscription Service Set ---
 
     async def create_subscription(
         self,
@@ -496,12 +500,15 @@ class UaSession(AbstractSession):
         return result
 
     def register_sink(self, subscription_id: int, sink: Sink | Callable[..., Any]) -> None:
+        """Deliver the PublishResults of the Subscription to sink (an object with enqueue, or a callable)."""
         self._subscription_callbacks[subscription_id] = sink
 
     def unregister_sink(self, subscription_id: int) -> None:
+        """Stop delivering the PublishResults of the Subscription."""
         self._subscription_callbacks.pop(subscription_id, None)
 
     def note_subscription_timing(self, subscription_id: int, publishing_interval: float, keep_alive_count: int) -> None:
+        """The revised timing (interval in seconds) that the Publish timeouts and the request count follow."""
         self._publishing_intervals[subscription_id] = publishing_interval
         self._keep_alive_times[subscription_id] = publishing_interval * keep_alive_count
         self._publish_wake.set()
@@ -520,8 +527,6 @@ class UaSession(AbstractSession):
         )
         self.logger.info("update_subscription success SubscriptionId %s", params.SubscriptionId)
         return result
-
-    modify_subscription = update_subscription  # legacy support
 
     async def delete_subscriptions(
         self, subscription_ids: list[int], timeout: float | None = None
@@ -555,6 +560,7 @@ class UaSession(AbstractSession):
     async def republish(
         self, subscription_id: int, retransmit_sequence_number: int, timeout: float | None = None
     ) -> ua.NotificationMessage:
+        """Republish one NotificationMessage the client missed (OPC 10000-4 v1.05, 5.14.6)."""
         self.logger.debug("republish sub=%s seq=%s", subscription_id, retransmit_sequence_number)
         request = ua.RepublishRequest()
         request.Parameters.SubscriptionId = subscription_id
@@ -565,17 +571,19 @@ class UaSession(AbstractSession):
         return response.NotificationMessage
 
     def inform_sinks(self, status: ua.StatusCode) -> None:
+        """Tell every Subscription about a status of the session, as session_event or a StatusChangeNotification."""
         status_message = ua.StatusChangeNotification(Status=status)
         notification_message = ua.NotificationMessage(NotificationData=[status_message])  # type: ignore[list-item]
         for subscription_id, sink in list(self._subscription_callbacks.items()):
-            event = getattr(sink, "session_event", None)
+            event: Callable[[ua.StatusCode], Any] | None = getattr(sink, "session_event", None)
             if event is not None:
-                self._call_sink(subscription_id, lambda event=event: event(status))
+                self._call_sink(subscription_id, functools.partial(event, status))
             else:
                 result = ua.PublishResult(subscription_id, NotificationMessage=notification_message)
                 self._deliver(subscription_id, sink, result)
 
     async def inform_subscriptions(self, status: ua.StatusCode) -> None:
+        """inform_sinks, for callers that await."""
         self.inform_sinks(status)
 
     async def publish(
@@ -593,17 +601,18 @@ class UaSession(AbstractSession):
             raise UaStructParsingError from ex
         return response
 
-    # --- Publish pipeline ---
-
     @property
     def publish_suspended(self) -> bool:
+        """Whether no Publish requests are sent, during a reconnect or after the session was lost."""
         return self._publish_suspended
 
     @property
     def publish_requests_outstanding(self) -> int:
+        """How many Publish requests wait for an answer."""
         return self._publish_in_flight
 
     def acknowledge(self, subscription_id: int, sequence_number: int) -> None:
+        """Acknowledge a NotificationMessage with the next Publish request."""
         self._ack_ledger[(subscription_id, sequence_number)] = None
         self._trim_ledger()
 
@@ -641,6 +650,7 @@ class UaSession(AbstractSession):
                 worker.cancel()
 
     def ensure_publish_loop(self) -> None:
+        """Start the Publish requests if there are Subscriptions and they are not running."""
         if not self._subscription_callbacks:
             return
         if self._publish_task is None or self._publish_task.done():
@@ -652,17 +662,20 @@ class UaSession(AbstractSession):
         self._publish_wake.set()
 
     def pause_publish(self) -> None:
+        """Stop sending Publish requests until resume_publish, for a reconnect."""
         self._publish_suspended = True
         for worker in self._publish_workers:
             worker.cancel()
 
     def resume_publish(self) -> None:
+        """Send Publish requests again after pause_publish."""
         self._publish_suspended = False
         self._publish_limit = None
         self.ensure_publish_loop()
         self._publish_wake.set()
 
     async def stop_publish(self) -> None:
+        """Cancel the Publish requests and the callbacks still running, and wait for them."""
         tasks = list(self._publish_workers)
         if self._publish_task is not None:
             tasks.append(self._publish_task)
@@ -857,14 +870,12 @@ class UaSession(AbstractSession):
         except Exception:
             self.logger.exception("Exception while calling user callback")
 
-    # --- MonitoredItem Service Set ---
-
     async def create_monitored_items(
         self,
         params: ua.CreateMonitoredItemsParameters,
         timeout: float | None = None,
     ) -> list[ua.MonitoredItemCreateResult]:
-        self.logger.info("create_monitored_items")
+        self.logger.debug("create_monitored_items")
         request = ua.CreateMonitoredItemsRequest()
         request.Parameters = params
         data = await self._send_request(request, timeout)
@@ -876,7 +887,7 @@ class UaSession(AbstractSession):
     async def delete_monitored_items(
         self, params: ua.DeleteMonitoredItemsParameters, timeout: float | None = None
     ) -> list[ua.StatusCode]:
-        self.logger.info("delete_monitored_items")
+        self.logger.debug("delete_monitored_items")
         request = ua.DeleteMonitoredItemsRequest()
         request.Parameters = params
         data = await self._send_request(request, timeout)
@@ -890,7 +901,7 @@ class UaSession(AbstractSession):
         params: ua.ModifyMonitoredItemsParameters,
         timeout: float | None = None,
     ) -> list[ua.MonitoredItemModifyResult]:
-        self.logger.info("modify_monitored_items")
+        self.logger.debug("modify_monitored_items")
         request = ua.ModifyMonitoredItemsRequest()
         request.Parameters = params
         data = await self._send_request(request, timeout)
@@ -901,8 +912,8 @@ class UaSession(AbstractSession):
 
     async def set_monitoring_mode(
         self, params: ua.SetMonitoringModeParameters, timeout: float | None = None
-    ) -> list[ua.uatypes.StatusCode]:
-        self.logger.info("set_monitoring_mode")
+    ) -> list[ua.StatusCode]:
+        self.logger.debug("set_monitoring_mode")
         request = ua.SetMonitoringModeRequest()
         request.Parameters = params
         data = await self._send_request(request, timeout)
@@ -913,8 +924,8 @@ class UaSession(AbstractSession):
 
     async def set_publishing_mode(
         self, params: ua.SetPublishingModeParameters, timeout: float | None = None
-    ) -> list[ua.uatypes.StatusCode]:
-        self.logger.info("set_publishing_mode")
+    ) -> list[ua.StatusCode]:
+        self.logger.debug("set_publishing_mode")
         request = ua.SetPublishingModeRequest()
         request.Parameters = params
         data = await self._send_request(request, timeout)

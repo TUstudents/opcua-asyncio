@@ -40,6 +40,20 @@ async def test_cli9_browse_nodes_accepts_a_generator(connected: Client) -> None:
     assert [node.nodeid for node, _ in pairs] == [node.nodeid for node in nodes]
 
 
+async def test_browse_nodes_follows_continuation_points(server: Server, connected: Client) -> None:
+    """Part 4, 5.9.3: the client reads every page of a Browse with BrowseNext."""
+    node = connected.get_node(ua.ObjectIds.Server)
+    expected = await node.get_references(ua.ObjectIds.References, ua.BrowseDirection.Forward)
+    server.iserver.max_browse_references_per_node = 2
+    try:
+        ((_, result),) = await connected.browse_nodes([node])
+    finally:
+        server.iserver.max_browse_references_per_node = 10_000
+    assert len(expected) > 2
+    assert not result.ContinuationPoint
+    assert [ref.NodeId for ref in result.References] == [ref.NodeId for ref in expected]
+
+
 async def test_cli9_result_count_mismatch_is_an_error(connected: Client, tampered_responses: ResponseTampering) -> None:
     """Part 4, 5.3: a response has one result per request item; a different count is an error."""
 

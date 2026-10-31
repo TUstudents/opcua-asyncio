@@ -56,6 +56,7 @@ class FileTransferError(ua.uaerrors.UaError):
 
     @property
     def bytes_read(self) -> int:
+        """How many bytes were read before the failure."""
         return len(self.partial_data)
 
 
@@ -141,14 +142,17 @@ class UaFile(_MethodCaller):
 
     @property
     def handle(self) -> int | None:
+        """The FileHandle the server returned from Open, None while the file is closed."""
         return self._file_handle
 
     @property
     def is_open(self) -> bool:
+        """Whether the file is open."""
         return self._file_handle is not None
 
     @property
     def chunk_size(self) -> int:
+        """The bytes per Read or Write call."""
         return self._chunk_size or DEFAULT_CHUNK_SIZE
 
     def _identity(self) -> int | None:

@@ -92,6 +92,11 @@ disable_error_code = ["literal-required", "name-defined"]
 [[tool.mypy.overrides]]
 module = [
   "enginir_opcua.common.*",
+  "enginir_opcua.client.client",
+  "enginir_opcua.client.ua_client",
+  "enginir_opcua.client.ua_file",
+  "enginir_opcua.client.ua_file_transfer",
+  "enginir_opcua.client.ua_session",
   "enginir_opcua.crypto.*",
   "enginir_opcua.ua.attribute_ids",
   "enginir_opcua.ua.numeric_range",

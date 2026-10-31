@@ -103,6 +103,16 @@ Client subscriptions (OPC 10000-4, 5.13 and 5.14):
   ends it without recreating. `Subscription.close()` ends it locally; `Subscription.state` is new.
 - `Subscription.modify_monitored_item` takes a float deadband (`mod_filter_val`); a `UaStatusCodeError` raised for a
   local service failure keeps the `ServiceError` as its cause, and `set_publishing_mode` no longer logs every call.
+- `Client.browse_nodes` follows continuation points with BrowseNext, so a server that pages its references no longer
+  yields a partial result with a ContinuationPoint; a point the server repeats without references is released.
+- A user certificate with a non-RSA private key raises `ConfigurationError` instead of a `TypeError` from the
+  cryptography library; `set_security` refuses a non-RSA application key the same way.
+- The per-request log messages of `UaSession` (browse, read_attributes, add_nodes, ...) are DEBUG instead of INFO, and
+  `find_endpoint`, `get_objects_node` and `get_namespace_index` no longer log at INFO.
+- `register_server` and `unregister_server` take an iterable of discovery configurations, as they always needed.
+- Removed: `UaClient.modify_subscription` and `UaSession.modify_subscription` (use `update_subscription`),
+  `UaClient.ensure_publish_loop`, `UaClient._subscription_callbacks` and `_publish_task` (use `uaclient.session`), and
+  `Client.secure_channel_id`, which was never set.
 
 File transfer (OPC 10000-5, Annex C):
 - `UaFile.read()` reads in chunks until an empty ByteString and no longer uses `Size`; `write()` is chunked.

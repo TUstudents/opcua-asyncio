@@ -1,3 +1,7 @@
+"""
+The high-level OPC UA client: connection, security, session, reconnect and the convenience calls on top of UaClient.
+"""
+
 import asyncio
 import contextvars
 import dataclasses
@@ -14,6 +18,7 @@ from urllib.parse import ParseResult, unquote, urlparse
 
 import anyio
 from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
@@ -98,12 +103,9 @@ class _ReverseConfig:
 
 class Client:
     """
-    High level client to connect to an OPC-UA server.
-    This class makes it easy to connect and browse address space.
-    It attempts to expose as much functionality as possible
-    but if you want more flexibility it is possible and advised to
-    use UaClient object, available as self.uaclient
-    which offers the raw OPC-UA services interface.
+    A client of one OPC UA server: connect() opens the connection, the secure channel and the session, and keeps
+    them alive (channel renewal, a liveness probe and, with auto_reconnect, reconnection with the subscriptions
+    restored). get_node gives Nodes to work with. The raw services are on self.uaclient.
     """
 
     def __init__(
@@ -140,9 +142,11 @@ class Client:
             `url`. Its timeout and auto_reconnect replace the parameters; the PKI directory and the security are
             applied at the first connect().
 
-        Some other client parameters can be changed by setting
-        attributes on the constructed object:
-        See the source code for the exhaustive list.
+        Attributes to set before connect(): name, description, application_uri and product_uri describe this
+        client; secure_channel_timeout and session_timeout (ms) are requested and replaced by the revised values;
+        application_hook is an extra check of the server certificate after validation, which rejects it by raising
+        a ServiceError; session_state_path, a file in which the session is kept, lets a new client process resume
+        the session of the previous one with ActivateSession (OPC 10000-4 v1.05, 6.7) instead of creating one.
         """
         self._config: ClientConfig | None = config
         self._config_applied = False
@@ -173,10 +177,9 @@ class Client:
         self.application_uri = "urn:enginir:opcua:client"
         self.product_uri = "urn:enginir:opcua"
         self.server_uri: str | None = None
-        self.security_policy = security_policies.SecurityPolicyNone()
-        self.secure_channel_id = None
-        self.secure_channel_timeout = 3600000  # 1 hour
-        self.session_timeout = 3600000  # 1 hour
+        self.security_policy: security_policies.SecurityPolicy = security_policies.SecurityPolicyNone()
+        self.secure_channel_timeout = 3_600_000
+        self.session_timeout = 3_600_000
         self.connection_lost_callback: Callable[[Exception], Coroutine[Any, Any, None]] | None = None
         self._policy_ids: list[ua.UserTokenPolicy] = []
         self._discovered_endpoints: list[ua.EndpointDescription] | None = None
@@ -192,7 +195,7 @@ class Client:
         self.user_certificate: x509.Certificate | None = None
         self.user_private_key: PrivateKeyTypes | None = None
         self.user_certificate_chain: list[x509.Certificate] = []
-        self._server_nonce = None
+        self._server_nonce: bytes | None = None
         self._session_counter = 1
         self.nodes: Shortcuts = Shortcuts(self.uaclient.session)
         self.max_messagesize = 0
@@ -200,10 +203,8 @@ class Client:
         self._renew_channel_task: asyncio.Task[None] | None = None
         self._supervisor_task: asyncio.Task[None] | None = None
         self._stale_watchdog_task: asyncio.Task[None] | None = None
-        self._locale = ["en"]
+        self._locale: list[str] = ["en"]
         self._watchdog_intervall = watchdog_intervall
-        # Tracked so the auto-reconnect supervisor can re-create them; delete()
-        # flips Subscription.is_deleted and the supervisor skips those.
         self._subscriptions: list[Subscription] = []
         self._auto_reconnect: bool = auto_reconnect
         self._reconnect_max_delay: float = reconnect_max_delay
@@ -219,10 +220,6 @@ class Client:
         self._default_validator: CertificateValidator | None = None
         self._pinned_server_certificate: x509.Certificate | None = None
         self._own_credentials: pki.OwnCredentials | None = None
-        """extra check after the certificate validator accepted the server certificate, raises a ServiceError"""
-        # Set before connect() to let a fresh client process resume the existing
-        # server-side session via ActivateSession instead of creating a new one
-        # (OPC 10000-4 v1.05, 6.7) — useful after a client crash.
         self.session_state_path: Path | None = None
         self._reverse: _ReverseConfig | None = None
         if config is not None:
@@ -388,7 +385,7 @@ class Client:
         Among several matches the one with the url of the caller wins, then the highest SecurityLevel.
         """
         endpoints = list(endpoints)
-        _logger.info("find_endpoint %r %r %r", endpoints, security_mode, policy_uri)
+        _logger.debug("find_endpoint %r %r %r", endpoints, security_mode, policy_uri)
         matches = [
             ep
             for ep in endpoints
@@ -426,7 +423,7 @@ class Client:
         Normally the first matching locale in the list will be chosen, by the server.
         Call this before connect()
         """
-        self._locale = locale
+        self._locale = list(locale)
 
     def set_max_concurrent_requests(self, max_concurrent_requests: int) -> None:
         """Set the maximum number of requests sent concurrently."""
@@ -480,7 +477,7 @@ class Client:
               the private key password.
         """
         if not string:
-            return None
+            return
         parts = string.split(",")
         if len(parts) < 4:
             raise ua.UaError(f"Wrong format: `{string}`, expected at least 4 comma-separated values")
@@ -502,7 +499,7 @@ class Client:
         if parts[1] not in modes:
             raise ConfigurationError(f"Unknown security mode {parts[1]!r}; use one of {sorted(modes)}")
         mode = modes[parts[1]]
-        return await self.set_security(
+        await self.set_security(
             policy_class, parts[2], parts[3], client_key_password, parts[4] if len(parts) >= 5 else None, mode
         )
 
@@ -512,13 +509,15 @@ class Client:
         certificate: str | uacrypto.CertProperties | bytes | Path | None = None,
         private_key: str | uacrypto.CertProperties | bytes | Path | None = None,
         private_key_password: str | bytes | None = None,
-        server_certificate: str | uacrypto.CertProperties | bytes | None = None,
+        server_certificate: str | uacrypto.CertProperties | bytes | Path | None = None,
         mode: ua.MessageSecurityMode = ua.MessageSecurityMode.SignAndEncrypt,
         certificate_chain: Sequence[str | uacrypto.CertProperties | bytes | Path] | None = None,
     ) -> None:
         """
-        Set SecureChannel mode.
-        Without certificate and private_key the ones of the PKI directory (set_pki_directory) are used.
+        Set the security policy and mode of the secure channel; certificate, private key and server certificate are
+        paths, file contents or CertProperties. Without certificate and private_key the ones of the PKI directory
+        (set_pki_directory) are used. A server certificate given here is trusted (pinned); without one the
+        endpoints are read over an unsecured channel and the server certificate must pass the trust store.
         Call this before connect()
         """
         if certificate is None or private_key is None:
@@ -535,18 +534,23 @@ class Client:
                 f"{policy.__name__} is deprecated and is only available with Client(allow_deprecated_policies=True)"
             )
         pin_server_certificate = server_certificate is not None
+        server: uacrypto.CertProperties | x509.Certificate
         if server_certificate is None:
-            # Force unencrypted/unsigned SecureChannel to list the endpoints
             new_policy = security_policies.SecurityPolicyNone()
             self.security_policy = new_policy
             self.uaclient.security_policy = new_policy
             endpoints = await self.connect_and_get_server_endpoints()
             self._discovered_endpoints = endpoints
             endpoint = Client.find_endpoint(endpoints, mode, policy.URI, self.server_url.geturl())
-            server_certificate = uacrypto.x509_from_der(endpoint.ServerCertificate)
+            discovered = uacrypto.x509_from_der(endpoint.ServerCertificate)
+            if discovered is None:
+                raise ua.UaError(f"The endpoint {endpoint.EndpointUrl} has no server certificate")
+            server = discovered
             await self._keep_endpoint_certificate(endpoint)
-        elif not isinstance(server_certificate, uacrypto.CertProperties):
-            server_certificate = uacrypto.CertProperties(server_certificate)
+        elif isinstance(server_certificate, uacrypto.CertProperties):
+            server = server_certificate
+        else:
+            server = uacrypto.CertProperties(server_certificate)
         if not isinstance(certificate, uacrypto.CertProperties):
             certificate = uacrypto.CertProperties(certificate)
         certificate_chain = certificate_chain or []
@@ -556,9 +560,7 @@ class Client:
         ]
         if not isinstance(private_key, uacrypto.CertProperties):
             private_key = uacrypto.CertProperties(private_key, password=private_key_password)
-        return await self._set_security(
-            policy, certificate, private_key, server_certificate, mode, chain, pin_server_certificate
-        )
+        await self._set_security(policy, certificate, private_key, server, mode, chain, pin_server_certificate)
 
     async def _keep_endpoint_certificate(self, endpoint: ua.EndpointDescription) -> None:
         """
@@ -590,14 +592,16 @@ class Client:
         policy: type[security_policies.SecurityPolicy],
         certificate: uacrypto.CertProperties,
         private_key: uacrypto.CertProperties,
-        server_cert: uacrypto.CertProperties,
+        server_cert: uacrypto.CertProperties | x509.Certificate,
         mode: ua.MessageSecurityMode = ua.MessageSecurityMode.SignAndEncrypt,
         certificate_chain: Sequence[uacrypto.CertProperties] | None = None,
         pin_server_certificate: bool = False,
     ) -> None:
         if isinstance(server_cert, uacrypto.CertProperties):
-            server_cert = await uacrypto.load_certificate(server_cert.path_or_content, server_cert.extension)
-        self._pinned_server_certificate = server_cert if pin_server_certificate else None
+            server_x509 = await uacrypto.load_certificate(server_cert.path_or_content, server_cert.extension)
+        else:
+            server_x509 = server_cert
+        self._pinned_server_certificate = server_x509 if pin_server_certificate else None
         self._default_validator = None
         cert = await uacrypto.load_certificate(certificate.path_or_content, certificate.extension)
         certificate_chain = certificate_chain or []
@@ -609,11 +613,13 @@ class Client:
             private_key.password,
             private_key.extension,
         )
+        if not isinstance(pk, rsa.RSAPrivateKey):
+            raise ConfigurationError(f"{policy.__name__} needs an RSA private key, got {type(pk).__name__}")
         uacrypto.check_certificate(cert, self.application_uri, socket.gethostname())
-        self.security_policy = policy(server_cert, cert, pk, mode, host_cert_chain=chain)
+        self.security_policy = policy(server_x509, cert, pk, mode, host_cert_chain=chain)
         self.uaclient.set_security(self.security_policy)
 
-    async def load_client_certificate(self, path: str, extension: str | None = None) -> None:
+    async def load_client_certificate(self, path: str | Path | bytes, extension: str | None = None) -> None:
         """
         Load user certificate from file, either pem or der
         """
@@ -628,7 +634,7 @@ class Client:
         )
 
     async def load_private_key(
-        self, path: Path, password: str | bytes | None = None, extension: str | None = None
+        self, path: str | Path | bytes, password: str | bytes | None = None, extension: str | None = None
     ) -> None:
         """
         Load user private key. This is used for authenticating using certificate
@@ -957,7 +963,10 @@ class Client:
         await self._prepare_certificate_validation()
         reverse = self._reverse
         if reverse is None:
-            await self.uaclient.connect_socket(self.server_url.hostname, self.server_url.port or DEFAULT_PORT)
+            host = self.server_url.hostname
+            if not host:
+                raise ConfigurationError(f"The server URL {self.server_url.geturl()!r} has no host")
+            await self.uaclient.connect_socket(host, self.server_url.port or DEFAULT_PORT)
             return
         await reverse.listener.start()
         transport, reverse.announced_endpoint_url = await reverse.target.accept(reverse.accept_timeout)
@@ -982,8 +991,8 @@ class Client:
         self.uaclient.certificate_validator = self._default_validator
 
     def disconnect_socket(self) -> None:
-        if self.uaclient:
-            self.uaclient.disconnect_socket()
+        """Close the TCP connection without closing the session or channel first."""
+        self.uaclient.disconnect_socket()
 
     async def send_hello(self) -> None:
         """
@@ -1005,7 +1014,6 @@ class Client:
             params.RequestType = ua.SecurityTokenRequestType.Renew
         params.SecurityMode = self.security_policy.Mode
         params.RequestedLifetime = self.secure_channel_timeout
-        # length should be equal to the length of key of symmetric encryption
         params.ClientNonce = create_nonce(self.security_policy.secure_channel_nonce_length)
         try:
             result = await self.uaclient.open_secure_channel(params)
@@ -1031,7 +1039,8 @@ class Client:
         )
 
     async def close_secure_channel(self) -> None:
-        return await self.uaclient.close_secure_channel()
+        """Send CloseSecureChannel; the socket stays open."""
+        await self.uaclient.close_secure_channel()
 
     async def get_endpoints(self) -> list[ua.EndpointDescription]:
         """Get a list of OPC-UA endpoints."""
@@ -1051,24 +1060,28 @@ class Client:
         return registered
 
     async def register_server(
-        self, server: "enginir_opcua.server.Server", discovery_configuration: ua.DiscoveryConfiguration | None = None
+        self,
+        server: "enginir_opcua.server.Server",
+        discovery_configuration: Iterable[ua.DiscoveryConfiguration] | None = None,
     ) -> None:
         """
         Register a server with a discovery server.
-        RegisterServer2 is sent, with discovery_configuration if given. Only when the discovery server answers
-        Bad_ServiceUnsupported, the older RegisterServer is sent instead.
+        RegisterServer2 is sent, with the discovery configurations if given (such as MdnsDiscoveryConfiguration).
+        Only when the discovery server answers Bad_ServiceUnsupported, the older RegisterServer is sent instead.
         """
         registered = self._registered_server(server, True)
         params = ua.RegisterServer2Parameters()
         params.Server = registered
-        params.DiscoveryConfiguration = discovery_configuration or []
+        params.DiscoveryConfiguration = list(discovery_configuration or [])
         try:
             await self.uaclient.register_server2(params)
         except ua.uaerrors.BadServiceUnsupported:
             await self.uaclient.register_server(registered)
 
     async def unregister_server(
-        self, server: "enginir_opcua.server.Server", discovery_configuration: ua.DiscoveryConfiguration | None = None
+        self,
+        server: "enginir_opcua.server.Server",
+        discovery_configuration: Iterable[ua.DiscoveryConfiguration] | None = None,
     ) -> None:
         """
         Remove a server from a discovery server: the same calls as register_server with IsOnline set to False.
@@ -1076,7 +1089,7 @@ class Client:
         registered = self._registered_server(server, False)
         params = ua.RegisterServer2Parameters()
         params.Server = registered
-        params.DiscoveryConfiguration = discovery_configuration or []
+        params.DiscoveryConfiguration = list(discovery_configuration or [])
         try:
             await self.uaclient.unregister_server2(params)
         except ua.uaerrors.BadServiceUnsupported:
@@ -1096,14 +1109,15 @@ class Client:
         return await self.uaclient.find_servers(params)
 
     async def find_servers_on_network(self) -> ua.FindServersOnNetworkResult:
+        """FindServersOnNetwork: the servers a discovery server knows on the network (OPC 10000-4 v1.05, 5.5.3)."""
         params = ua.FindServersOnNetworkParameters()
         return await self.uaclient.find_servers_on_network(params)
 
     async def create_session(self) -> ua.CreateSessionResult:
         """
-        send a CreateSessionRequest to server with reasonable parameters.
-        If you want to modify settings look at code of these methods
-        and make your own
+        CreateSession with this client's description and session timeout, then check what the server answered:
+        its nonce and signature, its certificate against the channel's, its endpoints against those discovery
+        returned, and the ApplicationUri in its certificate (OPC 10000-4 v1.05, 5.7.2).
         """
         desc = ua.ApplicationDescription()
         desc.ApplicationUri = self.application_uri
@@ -1112,8 +1126,7 @@ class Client:
         desc.ApplicationType = ua.ApplicationType.Client
         params = ua.CreateSessionParameters()
         params.ServerUri = None
-        # at least 32 random bytes for server to prove possession of private key (OPC 10000-4 v1.05, 5.7.2.2)
-        nonce = create_nonce(32)
+        nonce = create_nonce(SESSION_NONCE_MIN_LENGTH)
         params.ClientNonce = nonce
         params.ClientCertificate = self.security_policy.host_certificate or None
         params.ClientDescription = desc
@@ -1121,7 +1134,7 @@ class Client:
         self._session_counter += 1
         params.SessionName = f"{self.description} Session{self._session_counter} {secrets.token_hex(4)}"
         params.RequestedSessionTimeout = self.session_timeout
-        params.MaxResponseMessageSize = 0  # means no max size
+        params.MaxResponseMessageSize = 0
         response = await self.uaclient.create_session(params)
         self._check_session_nonce(response.ServerNonce)
         if self.security_policy.host_certificate is None:
@@ -1236,7 +1249,6 @@ class Client:
                     f"Timed out waiting for client to reconnect (state={self.uaclient.state.value})"
                 ) from None
 
-    # Kept as a back-compat alias for any external callers; the harness no longer registers it.
     check_connection = _wait_until_ready
 
     async def _connection_supervisor(self) -> None:
@@ -1456,8 +1468,7 @@ class Client:
                 _logger.exception("Failed to restore subscription")
 
     async def _close_session_quiet(self) -> None:
-        # Goes through UaClient, not Client.close_session, so it does NOT cancel the
-        # supervisor task; safe to call from inside the reconnect retry loop.
+        """CloseSession through UaClient, which unlike close_session leaves the supervisor running."""
         try:
             await self.uaclient.close_session(False)
         except Exception:
@@ -1509,7 +1520,6 @@ class Client:
             if policy.TokenType == token_type:
                 if policy.SecurityPolicyUri:
                     return policy
-                # empty URI means "use this endpoint's policy URI"
                 return dataclasses.replace(policy, SecurityPolicyUri=self.security_policy.URI)
         raise ConfigurationError(f"The endpoint does not offer the user token type {token_type.name}")
 
@@ -1520,7 +1530,9 @@ class Client:
         certificate: x509.Certificate | None = None,
     ) -> ua.ActivateSessionResult:
         """
-        Activate session using either username and password or private_key
+        ActivateSession with the user certificate (when a user private key is loaded), else the user name and
+        password, else anonymously; the client signature proves the channel's certificate (OPC 10000-4 v1.05,
+        5.7.3).
         """
         user_certificate = certificate
         params = ua.ActivateSessionParameters()
@@ -1577,9 +1589,9 @@ class Client:
         certificate_chain = certificate_chain or []
         for cert in certificate_chain:
             params.UserIdentityToken.CertificateData += uacrypto.der_from_x509(cert)
-        # OPC 10000-4 v1.05, 5.7.3.1: the data to sign is created by appending
-        # the last serverNonce to the serverCertificate
         policy = self.server_policy(ua.UserTokenType.Certificate)
+        if not isinstance(self.user_private_key, rsa.RSAPrivateKey):
+            raise ConfigurationError("A user certificate needs an RSA private key (load_private_key)")
         sig, alg = security_policies.sign_asymmetric(self.user_private_key, challenge, policy.SecurityPolicyUri)
         params.UserIdentityToken.PolicyId = policy.PolicyId
         params.UserTokenSignature.Algorithm = alg
@@ -1590,9 +1602,6 @@ class Client:
         params.UserIdentityToken.UserName = username
         policy = self.server_policy(ua.UserTokenType.UserName)
         if not policy.SecurityPolicyUri or policy.SecurityPolicyUri == security_policies.SecurityPolicyNone.URI:
-            # see OPC 10000-4 v1.05, 7.40.4: if the token is NOT encrypted,
-            # then the password only contains UTF-8 encoded password
-            # and EncryptionAlgorithm is null
             if password:
                 if self.security_policy.Mode != ua.MessageSecurityMode.SignAndEncrypt:
                     _logger.warning("Sending plain-text password")
@@ -1605,12 +1614,13 @@ class Client:
         params.UserIdentityToken.PolicyId = policy.PolicyId
 
     def _encrypt_password(self, password: str, policy_uri: str) -> tuple[bytes, str]:
+        """The legacy encrypted secret: the length-prefixed UTF-8 password and server nonce (OPC 10000-4 v1.05, 7.40.2.2)."""
         server_certificate = uacrypto.x509_from_der(self.security_policy.peer_certificate)
         if server_certificate is None:
             raise ua.UaError("The server certificate is needed to encrypt the password")
         pubkey = server_certificate.public_key()
-        # see OPC 10000-4 v1.05, 7.40.2.2: if the token is encrypted, password
-        # shall be converted to UTF-8 and serialized with server nonce
+        if not isinstance(pubkey, rsa.RSAPublicKey):
+            raise ua.UaError("The server certificate has no RSA key to encrypt the password with")
         passwd = password.encode("utf8")
         if self._server_nonce is not None:
             passwd += self._server_nonce
@@ -1619,9 +1629,7 @@ class Client:
         return data, uri
 
     async def close_session(self) -> None:
-        """
-        Close session
-        """
+        """CloseSession, after stopping the supervisor, the stale-subscription watchdog and the channel renewal."""
         self.uaclient.request_disconnect()
         await self._cancel_task(self._stale_watchdog_task)
         self._stale_watchdog_task = None
@@ -1633,7 +1641,7 @@ class Client:
         self._renew_channel_task = None
         token = _supervisor_owns_requests.set(True)
         try:
-            return await self.uaclient.close_session(True)
+            await self.uaclient.close_session(True)
         finally:
             _supervisor_owns_requests.reset(token)
 
@@ -1649,13 +1657,15 @@ class Client:
             pass
 
     def get_root_node(self) -> Node:
+        """The Root folder."""
         return self.get_node(ua.TwoByteNodeId(ua.ObjectIds.RootFolder))
 
     def get_objects_node(self) -> Node:
-        _logger.info("get_objects_node")
+        """The Objects folder."""
         return self.get_node(ua.TwoByteNodeId(ua.ObjectIds.ObjectsFolder))
 
     def get_server_node(self) -> Node:
+        """The Server object."""
         return self.get_node(ua.FourByteNodeId(ua.ObjectIds.Server))
 
     def get_node(self, nodeid: Node | ua.NodeId | str | int) -> Node:
@@ -1716,21 +1726,22 @@ class Client:
         """
         Deletes the provided list of subscription_ids
         """
-        return await self.uaclient.delete_subscriptions(subscription_ids)
+        return await self.uaclient.delete_subscriptions(list(subscription_ids))
 
     async def get_namespace_array(self) -> list[str]:
+        """Read the NamespaceArray of the server; the type registry resolves namespace URIs with it."""
         ns_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_NamespaceArray))
         self._namespace_uris = list(await ns_node.read_value())
         return list(self._namespace_uris)
 
     async def get_namespace_index(self, uri: str) -> int:
-        uries = await self.get_namespace_array()
-        _logger.info("get_namespace_index %s %r", type(uries), uries)
-        return uries.index(uri)
+        """The index of a namespace URI in the server's NamespaceArray; ValueError if it is not there."""
+        return (await self.get_namespace_array()).index(uri)
 
     async def delete_nodes(
         self, nodes: Iterable[Node], recursive: bool = False
     ) -> tuple[list[Node], list[ua.StatusCode]]:
+        """DeleteNodes for the nodes; see manage_nodes.delete_nodes."""
         return await delete_nodes(self.uaclient.session, nodes, recursive)
 
     async def import_xml(
@@ -1781,7 +1792,7 @@ class Client:
         WARNING: protocol has changed in 1.04. use load_data_type_definitions()
         """
         _logger.warning("Deprecated since spec 1.04, call load_data_type_definitions")
-        return await load_type_definitions(self, nodes)
+        return await load_type_definitions(self, None if nodes is None else list(nodes))
 
     async def load_data_type_definitions(
         self, node: Node | None = None, overwrite_existing: bool = False
@@ -1822,7 +1833,7 @@ class Client:
         nodes = list(nodes)
         await self.uaclient.unregister_nodes([node.nodeid for node in nodes])
         for node in nodes:
-            if not node.basenodeid:
+            if node.basenodeid is None:
                 continue
             node.nodeid = node.basenodeid
             node.basenodeid = None
@@ -1858,13 +1869,14 @@ class Client:
                 result.check()
         return results
 
-    get_values = read_values  # legacy compatibility
-    set_values = write_values  # legacy compatibility
+    get_values = read_values
+    set_values = write_values
 
     async def browse_nodes(self, nodes: Iterable[Node]) -> list[tuple[Node, ua.BrowseResult]]:
         """
-        Browses multiple nodes in one ua call
-        returns a List of Tuples(Node, BrowseResult)
+        Browse the forward and inverse references of several nodes in one Browse request and return (Node,
+        BrowseResult) pairs. Results the server split into pages are completed with BrowseNext, so every result
+        holds all references and no ContinuationPoint.
         """
         nodes = list(nodes)
         nodestobrowse = []
@@ -1880,11 +1892,41 @@ class Client:
         parameters.NodesToBrowse = nodestobrowse
         results = await self.uaclient.browse(parameters)
         check_result_count(len(nodes), len(results))
+        await self._browse_remaining_pages(results)
         return list(zip(nodes, results))
+
+    async def _browse_remaining_pages(self, results: list[ua.BrowseResult]) -> None:
+        pending = [result for result in results if result.ContinuationPoint]
+        while pending:
+            params = ua.BrowseNextParameters()
+            params.ContinuationPoints = [result.ContinuationPoint for result in pending]
+            params.ReleaseContinuationPoints = False
+            pages = await self.uaclient.browse_next(params)
+            check_result_count(len(pending), len(pages))
+            still_open: list[ua.BrowseResult] = []
+            stuck: list[bytes] = []
+            for result, page in zip(pending, pages):
+                previous = result.ContinuationPoint
+                result.References.extend(page.References)
+                result.StatusCode = page.StatusCode
+                result.ContinuationPoint = page.ContinuationPoint if page.StatusCode.is_good() else None
+                if not result.ContinuationPoint:
+                    continue
+                if page.References or result.ContinuationPoint != previous:
+                    still_open.append(result)
+                else:
+                    stuck.append(result.ContinuationPoint)
+                    result.ContinuationPoint = None
+            if stuck:
+                await self.uaclient.browse_next(
+                    ua.BrowseNextParameters(ReleaseContinuationPoints=True, ContinuationPoints=stuck)
+                )
+            pending = still_open
 
     async def translate_browsepaths(
         self, starting_node: ua.NodeId, relative_paths: Iterable[ua.RelativePath | str]
     ) -> list[ua.BrowsePathResult]:
+        """TranslateBrowsePathsToNodeIds for several RelativePaths (or their text form) from one starting node."""
         bpaths = []
         for p in relative_paths:
             try:

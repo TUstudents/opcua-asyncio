@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 from enginir_opcua import Client, Server, ua
 from enginir_opcua.client.ua_client import UaClient
@@ -691,3 +691,18 @@ async def test_srv101_the_default_authenticate_calls_get_user() -> None:
             return User(role=UserRole.Admin, name=username)
 
     assert await Manager().authenticate(None, username="x") == User(role=UserRole.Admin, name="x")
+
+
+def test_a_user_certificate_needs_an_rsa_private_key() -> None:
+    """The RSA security policies sign the user token with RSA; another key is a configuration error, not a TypeError."""
+    client = Client("opc.tcp://127.0.0.1:4840")
+    client.user_private_key = ec.generate_private_key(ec.SECP256R1())
+    client._policy_ids = [
+        ua.UserTokenPolicy(
+            PolicyId="cert", TokenType=ua.UserTokenType.Certificate, SecurityPolicyUri=SecurityPolicyBasic256Sha256.URI
+        )
+    ]
+    certificate = uacrypto.x509_from_der((PKI_FILES / "certificate-example.der").read_bytes())
+    assert certificate is not None
+    with pytest.raises(ua.uaerrors.ConfigurationError, match="RSA private key"):
+        client._add_certificate_auth(ua.ActivateSessionParameters(), certificate, b"challenge")
