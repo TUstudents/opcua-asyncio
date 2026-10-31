@@ -472,6 +472,15 @@ Custom types:
   environment returns a new dictionary instead of writing into `ua`.
 - `ua.DataTypeAttributes` has no `DataTypeDefinition` field and no reserved bit 22 (OPC 10000-4, 7.24.8).
 - `StructNode.add_field(field_name, field_type, is_array)`; the dictionary builder checks every result.
+- The dictionary builder writes the built-in types that are not OPC Binary standard types (NodeId, LocalizedText,
+  Variant, ...) as `ua:` types, as the standard dictionary does (OPC 10000-5, C.3), instead of `opc:` types that other
+  stacks cannot resolve. `DataTypeDictionaryBuilder` raises `UaError` when used before `init()`.
+- A field of a dictionary EnumeratedType defaults to the enumeration's first value, not its last. Code from
+  `generate-structs` defaults a Guid to the null Guid and a DateTime to 1601-01-01, as the classes built at run time do,
+  instead of one random Guid and the import time shared by all instances.
+- `make_structure` raises `TypeError` or `ValueError` when the class cannot be built instead of returning `{}`.
+  Removed: `structures104.get_default_value` (its only user, the code generator, has its own), `get_ua_class`,
+  `OPCTypeDictionaryBuilder.indent` (`get_dict_value` uses `xml.etree.ElementTree.indent`) and `Field.enum_value`.
 
 Code generation:
 - The generated code comes from the `nodeset` submodule, pinned to UA-Nodeset `UA-1.05.07-2026-05-01`.

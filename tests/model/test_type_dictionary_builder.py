@@ -9,7 +9,6 @@ from enginir_opcua.common.type_dictionary_builder import (
     DataTypeDictionaryBuilder,
     OPCTypeDictionaryBuilder,
     StructNode,
-    get_ua_class,
 )
 from tests.conftest import find_free_port
 
@@ -18,11 +17,6 @@ ns_urn = "http://test.freeopcua.github.io"
 
 
 pytestmark = pytest.mark.asyncio
-
-
-def to_camel_case(name):
-    func = getattr(enginir_opcua.common.type_dictionary_builder, "_to_camel_case")
-    return func(name)
 
 
 def reference_generator(source_id, target_id, reference_type, is_forward=True):
@@ -66,18 +60,6 @@ async def srv(_srv):
     yield _srv
 
 
-async def test_camel_case_1():
-    case = "TurtleActionlibShapeActionFeedback"
-    result = to_camel_case("turtle_actionlib/ShapeActionFeedback")
-    assert result == case
-
-
-async def test_camel_case_2():
-    case = "HelloWorldFffD"
-    result = to_camel_case("Hello#world+fff_**?&&d")
-    assert result == case
-
-
 async def test_opc_type_dict_process_type_opc(srv):
     case = "opc:Boolean"
     result = getattr(srv.opc_type_builder, "_process_type")("Boolean")
@@ -88,6 +70,21 @@ async def test_opc_type_dict_process_type_tns(srv):
     case = "tns:CustomizedStruct"
     result = getattr(srv.opc_type_builder, "_process_type")("CustomizedStruct")
     assert result == case
+
+
+@pytest.mark.parametrize(
+    ("data_type", "prefixed"),
+    [
+        ("Int32", "opc:Int32"),
+        ("Guid", "opc:Guid"),
+        ("NodeId", "ua:NodeId"),
+        ("Variant", "ua:Variant"),
+        ("Mine", "tns:Mine"),
+    ],
+)
+def test_opc_type_dict_uses_the_namespace_of_the_standard_dictionary(data_type: str, prefixed: str) -> None:
+    """Part 5, Annex C.3: only the standard type descriptions are opc: types; the built-in UA types are ua: types."""
+    assert OPCTypeDictionaryBuilder(ns_urn)._process_type(data_type) == prefixed
 
 
 async def test_opc_type_dict_append_struct_1(srv):
@@ -126,7 +123,7 @@ async def test_opc_type_dict_get_dict_value(srv):
     # external tree operation
     appended_struct = Et.SubElement(srv.test_etree.getroot(), "opc:StructuredType")
     appended_struct.attrib["BaseType"] = "ua:ExtensionObject"
-    appended_struct.attrib["Name"] = to_camel_case(structure_name)
+    appended_struct.attrib["Name"] = structure_name
 
     srv.opc_type_builder.add_field(ua.VariantType.Boolean, "id", structure_name)
     # external tree operation
@@ -147,7 +144,7 @@ async def test_reference_generator(srv, forward):
     assert result.IsForward is forward
     assert result.ReferenceTypeId == ref
     assert result.SourceNodeId == id1
-    assert result.TargetNodeClass == ua.NodeClass.DataType
+    assert result.TargetNodeClass == ua.NodeClass.Unspecified
     assert result.TargetNodeId == id2
 
 
@@ -243,7 +240,7 @@ async def test_data_type_dict_set_dict_byte_string(srv):
     # external tree operation
     appended_struct = Et.SubElement(srv.test_etree.getroot(), "opc:StructuredType")
     appended_struct.attrib["BaseType"] = "ua:ExtensionObject"
-    appended_struct.attrib["Name"] = to_camel_case(structure_name)
+    appended_struct.attrib["Name"] = structure_name
 
     # external tree operation
     field = Et.SubElement(appended_struct, "opc:Field")
@@ -265,7 +262,7 @@ async def test_data_type_dict_add_field_1(srv):
     srv.dict_builder.add_field(ua.VariantType.Int32, "id", struct_name)
     await srv.dict_builder.set_dict_byte_string()
     await srv.srv.load_type_definitions()
-    struct = get_ua_class(struct_name)
+    struct = getattr(ua, struct_name)
     struct_instance = struct()
     assert struct_instance.id == 0
 
@@ -276,7 +273,7 @@ async def test_data_type_dict_add_field_2(srv):
     srv.dict_builder.add_field(ua.VariantType.Int32, "id", struct_name, is_array=True)
     await srv.dict_builder.set_dict_byte_string()
     await srv.srv.load_type_definitions()
-    struct = get_ua_class(struct_name)
+    struct = getattr(ua, struct_name)
     struct_instance = struct()
     assert isinstance(struct_instance.id, list)
 
@@ -295,7 +292,7 @@ async def test_struct_node_add_field(srv):
     struct_node.add_field("id", ua.VariantType.Int32)
     await srv.dict_builder.set_dict_byte_string()
     await srv.srv.load_type_definitions()
-    struct = get_ua_class(struct_name)
+    struct = getattr(ua, struct_name)
     struct_instance = struct()
     assert struct_instance.id == 0
 
@@ -317,7 +314,7 @@ async def test_functional_basic(srv):
         datatype=basic_struct.data_type,
     )
 
-    basic_msg = get_ua_class(basic_struct_name)()
+    basic_msg = getattr(ua, basic_struct_name)()
     basic_msg.ID = 3
     basic_msg.Gender = True
     basic_msg.Comments = "Test string"
@@ -351,7 +348,7 @@ async def test_functional_advance(srv):
         datatype=basic_struct.data_type,
     )
 
-    basic_msg = get_ua_class(basic_struct_name)()
+    basic_msg = getattr(ua, basic_struct_name)()
     basic_msg.ID = 3
     basic_msg.Gender = True
     basic_msg.Comments = "Test string"
@@ -364,7 +361,7 @@ async def test_functional_advance(srv):
         datatype=nested_struct.data_type,
     )
 
-    nested_msg = get_ua_class(nested_struct_name)()
+    nested_msg = getattr(ua, nested_struct_name)()
     nested_msg.Stuff = basic_msg
     nested_msg.Name = "Max"
     nested_msg.Surname = "Karl"

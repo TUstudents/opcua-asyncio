@@ -1,4 +1,5 @@
 import builtins
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -122,6 +123,39 @@ def test_type_dictionary_enum_values_are_integers():
     generator.get_python_classes(env)
     assert env["Evil"].A == 7
     assert env["UsesEvil"]().Field is env["Evil"].A
+
+
+ORDERED_ENUM_DICTIONARY = b"""<opc:TypeDictionary xmlns:opc="http://opcfoundation.org/BinarySchema/" TargetNamespace="urn:test">
+  <opc:EnumeratedType Name="Level" LengthInBits="32">
+    <opc:EnumeratedValue Name="Low" Value="0"/>
+    <opc:EnumeratedValue Name="Mid" Value="1"/>
+    <opc:EnumeratedValue Name="High" Value="2"/>
+  </opc:EnumeratedType>
+  <opc:StructuredType BaseType="ua:ExtensionObject" Name="UsesLevel">
+    <opc:Field TypeName="tns:Level" Name="Field" />
+  </opc:StructuredType>
+</opc:TypeDictionary>"""
+
+
+def test_type_dictionary_enum_field_defaults_to_the_first_value():
+    generator = StructGenerator()
+    generator.make_model_from_string(ORDERED_ENUM_DICTIONARY)
+    env: dict[str, Any] = {}
+    generator.get_python_classes(env)
+    assert env["UsesLevel"]().Field is env["Level"].Low
+
+
+def test_generated_code_and_runtime_classes_have_the_same_defaults(tmp_path: Path) -> None:
+    generator = StructGenerator()
+    generator.make_model_from_file(EXAMPLE_BSD_PATH)
+    output_path = tmp_path / "generated_structs.py"
+    generator.save_to_file(str(output_path))
+    ns: dict[str, Any] = {}
+    exec(output_path.read_text(), ns)
+    built = generator.get_python_classes({})["ScalarValueDataType"]
+    first, second, runtime = ns["ScalarValueDataType"](), ns["ScalarValueDataType"](), built()
+    assert first.GuidValue == second.GuidValue == runtime.GuidValue == uuid.UUID(int=0)
+    assert first.DateTimeValue == runtime.DateTimeValue == ua.get_win_epoch()
 
 
 def test_custom_structs_array(tmpdir):
