@@ -1,8 +1,12 @@
+"""
+Events (OPC 10000-3 v1.05, 4.6; OPC 10000-4 v1.05, 7.7.3): the Event object, building EventFilters from EventTypes
+and turning a custom EventType of the address space into an Event to fire.
+"""
+
 import copy
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
-import enginir_opcua
 from enginir_opcua import ua
 
 from ..ua.uaerrors import UaError
@@ -13,32 +17,24 @@ if TYPE_CHECKING:
 
 
 _BROWSE_MASK = ua.BrowseResultMask.NodeClass | ua.BrowseResultMask.ReferenceTypeId | ua.BrowseResultMask.BrowseName
+_OBJECTS_AND_VARIABLES = ua.NodeClass.Object | ua.NodeClass.Variable
+_BASE_EVENT_TYPE = ua.NodeId(ua.ObjectIds.BaseEventType)
 
 
 class Event:
     """
-    OPC UA Event object.
-    This is class in inherited by the common event objects such as BaseEvent,
-    other auto standard events and custom events
-    Events are used to trigger events on server side and are
-    sent to clients for every events from server
-
-    Developer Warning:
-    On server side the data type of attributes should be known, thus
-    add properties using the add_property method!!!
+    An Event: its fields are attributes named by their browse path ("Severity", "EnabledState/Id"). The generated
+    classes in event_objects (BaseEvent and the other standard EventTypes) derive from it. On the server side a
+    field needs its VariantType, so add fields with add_property; on the client side from_event_fields builds the
+    Event from the fields of a notification.
     """
 
     def __init__(self, emitting_node: ua.NodeId | int = ua.ObjectIds.Server) -> None:
         self.server_handle: int | None = None
         self.select_clauses: list[ua.SimpleAttributeOperand] | None = None
         self.event_fields: list[ua.Variant] | None = None
-        self.data_types: dict[str, ua.VariantType] = {}
-        self.emitting_node: ua.NodeId
-        if isinstance(emitting_node, ua.NodeId):
-            self.emitting_node = emitting_node
-        else:
-            self.emitting_node = ua.NodeId(emitting_node)
-        # save current attributes
+        self.data_types: dict[str, ua.VariantType | ua.VariantTypeCustom] = {}
+        self.emitting_node = emitting_node if isinstance(emitting_node, ua.NodeId) else ua.NodeId(emitting_node)
         self.internal_properties = [*self.__dict__.keys(), "internal_properties"]
 
     def __str__(self) -> str:
@@ -49,15 +45,15 @@ class Event:
 
     __repr__ = __str__
 
-    def add_property(self, name: str, val: Any, datatype: ua.VariantType) -> None:
+    def add_property(self, name: str, val: Any, datatype: ua.VariantType | ua.VariantTypeCustom) -> None:
+        """Set the field name to val and record the VariantType it is sent as."""
         setattr(self, name, val)
         self.data_types[name] = datatype
 
-    def add_variable(self, name: str, val: Any, datatype: ua.VariantType) -> None:
-        setattr(self, name, val)
-        self.data_types[name] = datatype
+    add_variable = add_property
 
     def get_event_props_as_fields_dict(self) -> dict[str, ua.Variant]:
+        """Every field that has a VariantType, as Variants; a value that does not fit its type becomes a null."""
         field_vars: dict[str, ua.Variant] = {}
         for key, datatype in self.data_types.items():
             value = getattr(self, key, None)
@@ -69,23 +65,11 @@ class Event:
 
     @staticmethod
     def from_field_dict(fields: dict[str, ua.Variant]) -> "Event":
+        """The Event of get_event_props_as_fields_dict, as stored by the event history."""
         ev = Event()
         for k, v in fields.items():
             ev.add_property(k, v.Value, v.VariantType)
         return ev
-
-    def to_event_fields_using_subscription_fields(
-        self, select_clauses: list[ua.SimpleAttributeOperand]
-    ) -> list[ua.Variant]:
-        fields: list[ua.Variant] = []
-        if self.select_clauses is None or self.event_fields is None:
-            return fields
-        for sattr in select_clauses:
-            for idx, o_sattr in enumerate(self.select_clauses):
-                if sattr.BrowsePath == o_sattr.BrowsePath and sattr.AttributeId == o_sattr.AttributeId:
-                    fields.append(self.event_fields[idx])
-                    break
-        return fields
 
     def select_field(
         self,
@@ -93,6 +77,11 @@ class Event:
         is_subtype: Callable[[ua.NodeId, ua.NodeId], bool] | None = None,
         apply_range: Callable[[Any, str], tuple[int, Any]] | None = None,
     ) -> ua.Variant:
+        """
+        The value of one SelectClause (OPC 10000-4 v1.05, 7.7.4): a null Variant when the field is missing, the
+        clause names a TypeDefinitionId the Event is not of, or it selects another attribute than Value through a
+        path. is_subtype decides the TypeDefinitionId; apply_range applies an IndexRange and returns its status.
+        """
         if not self._type_definition_matches(sattr.TypeDefinitionId, is_subtype):
             return ua.Variant(None)
         if len(sattr.BrowsePath) == 0:
@@ -114,7 +103,8 @@ class Event:
             code, val = apply_range(val, sattr.IndexRange)
             if code != ua.StatusCodes.Good:
                 return ua.Variant(ua.StatusCode(code), ua.VariantType.StatusCode)
-        return ua.Variant(val, self.data_types.get(name))
+        datatype = self.data_types.get(name)
+        return ua.Variant(val) if datatype is None else ua.Variant(val, datatype)
 
     def _type_definition_matches(
         self, type_definition: ua.NodeId, is_subtype: Callable[[ua.NodeId, ua.NodeId], bool] | None
@@ -132,10 +122,12 @@ class Event:
         is_subtype: Callable[[ua.NodeId, ua.NodeId], bool] | None = None,
         apply_range: Callable[[Any, str], tuple[int, Any]] | None = None,
     ) -> list[ua.Variant]:
+        """The EventFieldList of a notification: select_field for each SelectClause."""
         return [self.select_field(sattr, is_subtype, apply_range) for sattr in select_clauses]
 
     @staticmethod
     def from_event_fields(select_clauses: list[ua.SimpleAttributeOperand], fields: list[ua.Variant]) -> "Event":
+        """The Event of an EventFieldList received for these SelectClauses."""
         ev = Event()
         ev.select_clauses = select_clauses
         ev.event_fields = fields
@@ -151,15 +143,15 @@ class Event:
 
     @staticmethod
     def browse_path_to_attribute_name(browsePath: list[ua.QualifiedName]) -> str:
-        name = browsePath[0].Name
-        iter_paths = iter(browsePath)
-        next(iter_paths)
-        for path in iter_paths:
-            name += "/" + path.Name
-        return name
+        """The field name of a browse path: the names joined by "/", without namespace indexes."""
+        return "/".join(str(element.Name) for element in browsePath)
 
 
 async def get_filter_from_event_type(eventtypes: list["Node"], where_clause_generation: bool = True) -> ua.EventFilter:
+    """
+    An EventFilter that selects every field the EventTypes and their supertypes declare and, with
+    where_clause_generation, lets through only Events of these types (where_clause_from_evtype).
+    """
     evfilter = ua.EventFilter()
     evfilter.SelectClauses = await select_clauses_from_evtype(eventtypes)
     if where_clause_generation:
@@ -167,15 +159,15 @@ async def get_filter_from_event_type(eventtypes: list["Node"], where_clause_gene
     return evfilter
 
 
-async def _append_new_attribute_to_select_clauses(
+def _append_new_attribute_to_select_clauses(
     select_clauses: list[ua.SimpleAttributeOperand],
-    already_selected: dict[str, str],
+    already_selected: set[str],
     browse_path: list[ua.QualifiedName],
     type_definition_id: ua.NodeId,
 ) -> None:
     string_path = "/".join(map(str, browse_path))
     if string_path not in already_selected:
-        already_selected[string_path] = string_path
+        already_selected.add(string_path)
         op = ua.SimpleAttributeOperand()
         op.AttributeId = ua.AttributeIds.Value
         op.BrowsePath = browse_path
@@ -183,11 +175,17 @@ async def _append_new_attribute_to_select_clauses(
         select_clauses.append(op)
 
 
+async def _aggregated_objects_and_variables(node: "Node") -> list[ua.ReferenceDescription]:
+    return await node.get_references(
+        ua.ObjectIds.Aggregates, ua.BrowseDirection.Forward, _OBJECTS_AND_VARIABLES, True, _BROWSE_MASK
+    )
+
+
 async def _select_clause_from_childs(
     child: "Node",
     refs: list[ua.ReferenceDescription],
     select_clauses: list[ua.SimpleAttributeOperand],
-    already_selected: dict[str, str],
+    already_selected: set[str],
     browse_path: list[ua.QualifiedName],
     type_definition_id: ua.NodeId,
     visited: frozenset[ua.NodeId] = frozenset(),
@@ -196,82 +194,60 @@ async def _select_clause_from_childs(
     for ref in refs:
         if ref.NodeId in visited:
             continue
+        path = [*browse_path, ref.BrowseName]
         if ref.NodeClass == ua.NodeClass.Variable:
+            _append_new_attribute_to_select_clauses(select_clauses, already_selected, path, type_definition_id)
             if ref.ReferenceTypeId == ua.NodeId(ua.ObjectIds.HasProperty):
-                await _append_new_attribute_to_select_clauses(
-                    select_clauses, already_selected, [*browse_path, ref.BrowseName], type_definition_id
-                )
-            else:
-                await _append_new_attribute_to_select_clauses(
-                    select_clauses, already_selected, [*browse_path, ref.BrowseName], type_definition_id
-                )
-                var = child.new_node(child.session, ref.NodeId)
-                refs = await var.get_references(
-                    ua.ObjectIds.Aggregates,
-                    ua.BrowseDirection.Forward,
-                    ua.NodeClass.Object | ua.NodeClass.Variable,
-                    True,
-                    _BROWSE_MASK,
-                )
-                await _select_clause_from_childs(
-                    var,
-                    refs,
-                    select_clauses,
-                    already_selected,
-                    [*browse_path, ref.BrowseName],
-                    type_definition_id,
-                    visited,
-                )
-        elif ref.NodeClass == ua.NodeClass.Object:
-            obj = child.new_node(child.session, ref.NodeId)
-            refs = await obj.get_references(
-                ua.ObjectIds.Aggregates,
-                ua.BrowseDirection.Forward,
-                ua.NodeClass.Object | ua.NodeClass.Variable,
-                True,
-                _BROWSE_MASK,
-            )
-            await _select_clause_from_childs(
-                obj, refs, select_clauses, already_selected, [*browse_path, ref.BrowseName], type_definition_id, visited
-            )
+                continue
+        elif ref.NodeClass != ua.NodeClass.Object:
+            continue
+        below = child.new_node(child.session, ref.NodeId)
+        await _select_clause_from_childs(
+            below,
+            await _aggregated_objects_and_variables(below),
+            select_clauses,
+            already_selected,
+            path,
+            type_definition_id,
+            visited,
+        )
+
+
+async def _supertype_chain(evtype: "Node") -> list["Node"]:
+    """evtype and its supertypes up to BaseEventType, evtype first; UaError if the chain branches, ends or loops."""
+    chain = [evtype]
+    seen = {evtype.nodeid}
+    current = evtype
+    while current.nodeid != _BASE_EVENT_TYPE:
+        parents = await current.get_referenced_nodes(refs=ua.ObjectIds.HasSubtype, direction=ua.BrowseDirection.Inverse)
+        if len(parents) != 1 or parents[0].nodeid in seen:
+            raise UaError(f"EventType {evtype.nodeid} does not have one chain of supertypes up to BaseEventType")
+        current = parents[0]
+        seen.add(current.nodeid)
+        chain.append(current)
+    return chain
 
 
 async def _event_type_nodes_up_to_base(evtype: "Node") -> list["Node"]:
     """Return EventTypes from BaseEventType to evtype (introducing types first)."""
-    nodes: list["Node"] = []
-    curr_node = evtype
-    while True:
-        nodes.append(curr_node)
-        if curr_node.nodeid == ua.NodeId(ua.ObjectIds.BaseEventType):
-            break
-        parents = await curr_node.get_referenced_nodes(
-            refs=ua.ObjectIds.HasSubtype, direction=ua.BrowseDirection.Inverse
-        )
-        if len(parents) != 1:
-            raise UaError(f"EventType {evtype.nodeid} does not have one chain of supertypes up to BaseEventType")
-        curr_node = parents[0]
-    nodes.reverse()
-    return nodes
+    return list(reversed(await _supertype_chain(evtype)))
 
 
 async def select_clauses_from_evtype(
     evtypes: list["Node"],
 ) -> list[ua.SimpleAttributeOperand]:
+    """
+    A SelectClause for every Variable the EventTypes and their supertypes aggregate, each path once, with the type
+    that introduces it as TypeDefinitionId; for a ConditionType also the ConditionId (OPC 10000-9 v1.05, 5.5.2).
+    """
     select_clauses: list[ua.SimpleAttributeOperand] = []
-    already_selected: dict[str, str] = {}
+    already_selected: set[str] = set()
     add_condition_id = False
     for evtype in evtypes:
         if not add_condition_id and await is_subtype(evtype, ua.NodeId(ua.ObjectIds.ConditionType)):
             add_condition_id = True
-        type_nodes = await _event_type_nodes_up_to_base(evtype)
-        for type_node in type_nodes:
-            refs = await type_node.get_references(
-                ua.ObjectIds.Aggregates,
-                ua.BrowseDirection.Forward,
-                ua.NodeClass.Object | ua.NodeClass.Variable,
-                True,
-                _BROWSE_MASK,
-            )
+        for type_node in await _event_type_nodes_up_to_base(evtype):
+            refs = await _aggregated_objects_and_variables(type_node)
             await _select_clause_from_childs(type_node, refs, select_clauses, already_selected, [], type_node.nodeid)
     if add_condition_id:
         op = ua.SimpleAttributeOperand()
@@ -308,12 +284,10 @@ async def where_clause_from_evtype(evtypes: list["Node"]) -> ua.ContentFilter:
         combine = ua.ContentFilterElement()
         combine.FilterOperator = ua.FilterOperator.Or
         elements.append(combine)
-        position = len(elements) - 1
         combine.FilterOperands.append(ua.ElementOperand(Index=len(elements)))
         elements.append(_of_type_element(remaining[0]))
         combine.FilterOperands.append(ua.ElementOperand(Index=len(elements)))
         build(remaining[1:])
-        assert elements[position] is combine
 
     build(list(evtypes))
     cf.Elements = elements
@@ -322,95 +296,87 @@ async def where_clause_from_evtype(evtypes: list["Node"]) -> ua.ContentFilter:
 
 async def select_event_attributes_from_type_node(
     node: "Node",
-    attributeSelector: Callable[["Node"], Coroutine[Any, Any, list[Any]]],
+    attributeSelector: Callable[["Node"], Awaitable[list[Any]]],
 ) -> list[Any] | None:
+    """
+    What attributeSelector returns for the EventType and each of its supertypes up to BaseEventType, the EventType's
+    first; None if the type has no single chain of supertypes up to BaseEventType.
+    """
+    try:
+        chain = await _supertype_chain(node)
+    except UaError:
+        return None
     attributes: list[Any] = []
-    curr_node = node
-    while True:
-        attributes.extend(await attributeSelector(curr_node))
-        if curr_node.nodeid == ua.NodeId(ua.ObjectIds.BaseEventType):
-            break
-        parents = await curr_node.get_referenced_nodes(
-            refs=ua.ObjectIds.HasSubtype, direction=ua.BrowseDirection.Inverse
-        )
-        if len(parents) != 1:
-            return None
-        curr_node = parents[0]
+    for type_node in chain:
+        attributes.extend(await attributeSelector(type_node))
     return attributes
 
 
 async def get_event_properties_from_type_node(node: "Node") -> list[Any] | None:
+    """The Properties of the EventType and its supertypes; see select_event_attributes_from_type_node."""
     return await select_event_attributes_from_type_node(node, lambda n: n.get_properties())
 
 
 async def get_event_variables_from_type_node(node: "Node") -> list[Any] | None:
+    """The component Variables of the EventType and its supertypes; see select_event_attributes_from_type_node."""
     return await select_event_attributes_from_type_node(node, lambda n: n.get_variables())
 
 
 async def get_event_objects_from_type_node(node: "Node") -> list[Any] | None:
+    """The component Objects of the EventType and its supertypes; see select_event_attributes_from_type_node."""
     return await select_event_attributes_from_type_node(
         node, lambda n: n.get_children(refs=ua.ObjectIds.HasComponent, nodeclassmask=ua.NodeClass.Object)
     )
 
 
+def _implemented_event(nodeid: ua.NodeId) -> type[Event] | None:
+    from .event_objects import IMPLEMENTED_EVENTS
+
+    if nodeid.NamespaceIndex != 0 or not isinstance(nodeid.Identifier, int):
+        return None
+    return IMPLEMENTED_EVENTS.get(nodeid.Identifier)
+
+
 async def get_event_obj_from_type_node(node: "Node") -> Event:
-    if node.nodeid.NamespaceIndex == 0:
-        if node.nodeid.Identifier in enginir_opcua.common.event_objects.IMPLEMENTED_EVENTS:
-            return enginir_opcua.common.event_objects.IMPLEMENTED_EVENTS[node.nodeid.Identifier]()  # type: ignore[index]
-
-    parent_nodeid, parent_eventtype = await _find_parent_eventtype(node)
-
-    class CustomEvent(parent_eventtype):  # type: ignore[valid-type]
-        def __init__(self) -> None:
-            parent_eventtype.__init__(self)
-            self.EventType = node.nodeid
-
-        async def _add_new_property(self, property: "Node", parent_variable: "Node | None") -> None:
-            name = (await property.read_browse_name()).Name
-            if parent_variable:
-                parent_name = (await parent_variable.read_browse_name()).Name
-                name = f"{parent_name}/{name}"
-            val = await property.read_data_value()
-            if val.Value is not None:
-                self.add_property(name, val.Value.Value, val.Value.VariantType)
-
-        async def _add_new_variable(self, variable: "Node") -> None:
-            name = (await variable.read_browse_name()).Name
-            val = await variable.read_data_value()
-            if val.Value is not None:
-                self.add_variable(name, val.Value.Value, await variable.read_data_type_as_variant_type())
-
-        async def init(self) -> None:
-            curr_node = node
-            while curr_node.nodeid != parent_nodeid:
-                for prop in await curr_node.get_properties():
-                    await self._add_new_property(prop, None)
-                for var in await curr_node.get_variables():
-                    await self._add_new_variable(var)
-                    for prop in await var.get_properties():
-                        await self._add_new_property(prop, var)
-                parents = await curr_node.get_referenced_nodes(
-                    refs=ua.ObjectIds.HasSubtype, direction=ua.BrowseDirection.Inverse
-                )
-                if len(parents) != 1:
-                    raise UaError("Parent of event type could not be found")
-                curr_node = parents[0]
-
-            self._freeze = True
-
-    ce = CustomEvent()
-    await ce.init()
-    return ce
+    """
+    An Event of the EventType node, to fire. A standard EventType gives its class from event_objects; a custom one
+    gives an instance of the nearest standard supertype's class with the Properties and Variables the custom types
+    on the way declare, set to their values in the address space. Raises UaError if the type has no single chain of
+    supertypes up to BaseEventType.
+    """
+    implemented = _implemented_event(node.nodeid)
+    if implemented is not None:
+        return implemented()
+    chain = await _supertype_chain(node)
+    for position, type_node in enumerate(chain):
+        parent_class = _implemented_event(type_node.nodeid)
+        if parent_class is not None:
+            break
+    else:
+        raise UaError(f"EventType {node.nodeid} has no standard supertype")
+    event = parent_class()
+    event.EventType = node.nodeid  # type: ignore[attr-defined]
+    for type_node in chain[:position]:
+        for prop in await type_node.get_properties():
+            await _add_field(event, prop, None)
+        for var in await type_node.get_variables():
+            await _add_variable_field(event, var)
+            for prop in await var.get_properties():
+                await _add_field(event, prop, var)
+    return event
 
 
-async def _find_parent_eventtype(node: "Node") -> tuple[ua.NodeId, type[Event]]:
-    """ """
-    parents = await node.get_referenced_nodes(refs=ua.ObjectIds.HasSubtype, direction=ua.BrowseDirection.Inverse)
-    if len(parents) != 1:
-        raise UaError("Parent of event type could not be found")
-    if parents[0].nodeid.NamespaceIndex == 0:
-        if parents[0].nodeid.Identifier in enginir_opcua.common.event_objects.IMPLEMENTED_EVENTS:
-            return parents[0].nodeid, enginir_opcua.common.event_objects.IMPLEMENTED_EVENTS[
-                parents[0].nodeid.Identifier  # type: ignore[index]
-            ]
-    return await _find_parent_eventtype(parents[0])
+async def _add_field(event: Event, field: "Node", parent_variable: "Node | None") -> None:
+    name = (await field.read_browse_name()).Name
+    if parent_variable is not None:
+        name = f"{(await parent_variable.read_browse_name()).Name}/{name}"
+    value = await field.read_data_value()
+    if value.Value is not None:
+        event.add_property(name, value.Value.Value, value.Value.VariantType)
+
+
+async def _add_variable_field(event: Event, variable: "Node") -> None:
+    name = (await variable.read_browse_name()).Name
+    value = await variable.read_data_value()
+    if value.Value is not None:
+        event.add_property(name, value.Value.Value, await variable.read_data_type_as_variant_type())

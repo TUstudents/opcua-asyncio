@@ -371,14 +371,14 @@ class Node:
         self,
         refs: Node | ua.NodeId | str | int = ua.ObjectIds.References,
         direction: ua.BrowseDirection = ua.BrowseDirection.Both,
-        nodeclassmask: ua.NodeClass = ua.NodeClass.Unspecified,
+        nodeclassmask: ua.NodeClass | int = ua.NodeClass.Unspecified,
         includesubtypes: bool = True,
-        result_mask: ua.BrowseResultMask = ua.BrowseResultMask.All,
+        result_mask: ua.BrowseResultMask | int = ua.BrowseResultMask.All,
     ) -> list[ua.ReferenceDescription]:
         """
         Browse the references of the node of type refs (and its subtypes with includesubtypes) in direction, keeping
-        targets of the NodeClasses in nodeclassmask, and follow the continuation points until all are read.
-        result_mask selects the fields of the ReferenceDescriptions.
+        targets of the NodeClasses in nodeclassmask (NodeClass values combined with |), and follow the continuation
+        points until all are read. result_mask selects the fields of the ReferenceDescriptions.
         """
         desc = ua.BrowseDescription()
         desc.BrowseDirection = direction

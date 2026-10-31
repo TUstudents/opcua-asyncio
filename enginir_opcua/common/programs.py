@@ -13,29 +13,37 @@ import datetime
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from enginir_opcua import Node, ua
 from enginir_opcua.common.event_objects import ProgramTransitionEvent
 
 from .statemachine import State, StateMachine, Transition
 
+if TYPE_CHECKING:
+    from enginir_opcua import Server
+
 _logger = logging.getLogger(__name__)
 
 PROGRAM_TYPE = ua.NodeId(ua.ObjectIds.ProgramStateMachineType)
 NO_LIMIT = 0xFFFFFFFF
 
-STATES = {"Halted": (2406, 11), "Ready": (2400, 12), "Running": (2402, 13), "Suspended": (2404, 14)}
+STATES = {
+    "Halted": (ua.ObjectIds.ProgramStateMachineType_Halted, 11),
+    "Ready": (ua.ObjectIds.ProgramStateMachineType_Ready, 12),
+    "Running": (ua.ObjectIds.ProgramStateMachineType_Running, 13),
+    "Suspended": (ua.ObjectIds.ProgramStateMachineType_Suspended, 14),
+}
 TRANSITIONS = {
-    "HaltedToReady": (2408, 1, "Halted", "Ready"),
-    "ReadyToRunning": (2410, 2, "Ready", "Running"),
-    "RunningToHalted": (2412, 3, "Running", "Halted"),
-    "RunningToReady": (2414, 4, "Running", "Ready"),
-    "RunningToSuspended": (2416, 5, "Running", "Suspended"),
-    "SuspendedToRunning": (2418, 6, "Suspended", "Running"),
-    "SuspendedToHalted": (2420, 7, "Suspended", "Halted"),
-    "SuspendedToReady": (2422, 8, "Suspended", "Ready"),
-    "ReadyToHalted": (2424, 9, "Ready", "Halted"),
+    "HaltedToReady": (ua.ObjectIds.ProgramStateMachineType_HaltedToReady, 1, "Halted", "Ready"),
+    "ReadyToRunning": (ua.ObjectIds.ProgramStateMachineType_ReadyToRunning, 2, "Ready", "Running"),
+    "RunningToHalted": (ua.ObjectIds.ProgramStateMachineType_RunningToHalted, 3, "Running", "Halted"),
+    "RunningToReady": (ua.ObjectIds.ProgramStateMachineType_RunningToReady, 4, "Running", "Ready"),
+    "RunningToSuspended": (ua.ObjectIds.ProgramStateMachineType_RunningToSuspended, 5, "Running", "Suspended"),
+    "SuspendedToRunning": (ua.ObjectIds.ProgramStateMachineType_SuspendedToRunning, 6, "Suspended", "Running"),
+    "SuspendedToHalted": (ua.ObjectIds.ProgramStateMachineType_SuspendedToHalted, 7, "Suspended", "Halted"),
+    "SuspendedToReady": (ua.ObjectIds.ProgramStateMachineType_SuspendedToReady, 8, "Suspended", "Ready"),
+    "ReadyToHalted": (ua.ObjectIds.ProgramStateMachineType_ReadyToHalted, 9, "Ready", "Halted"),
 }
 METHOD_TRANSITIONS: dict[str, dict[str, str]] = {
     "Start": {"Ready": "ReadyToRunning"},
@@ -44,22 +52,22 @@ METHOD_TRANSITIONS: dict[str, dict[str, str]] = {
     "Halt": {"Ready": "ReadyToHalted", "Running": "RunningToHalted", "Suspended": "SuspendedToHalted"},
     "Reset": {"Halted": "HaltedToReady"},
 }
-DIAGNOSTIC_COMPONENTS = {
-    "CreateSessionId": "CreateSessionId",
-    "CreateClientName": "CreateClientName",
-    "InvocationCreationTime": "InvocationCreationTime",
-    "LastTransitionTime": "LastTransitionTime",
-    "LastMethodCall": "LastMethodCall",
-    "LastMethodSessionId": "LastMethodSessionId",
-    "LastMethodInputArguments": "LastMethodInputArguments",
-    "LastMethodOutputArguments": "LastMethodOutputArguments",
-    "LastMethodInputValues": "LastMethodInputValues",
-    "LastMethodOutputValues": "LastMethodOutputValues",
-    "LastMethodCallTime": "LastMethodCallTime",
-    "LastMethodReturnStatus": "LastMethodReturnStatus",
-}
+DIAGNOSTIC_COMPONENTS = (
+    "CreateSessionId",
+    "CreateClientName",
+    "InvocationCreationTime",
+    "LastTransitionTime",
+    "LastMethodCall",
+    "LastMethodSessionId",
+    "LastMethodInputArguments",
+    "LastMethodOutputArguments",
+    "LastMethodInputValues",
+    "LastMethodOutputValues",
+    "LastMethodCallTime",
+    "LastMethodReturnStatus",
+)
 
-ControlHandler = Callable[["ProgramStateMachine", Any], Awaitable[Any]]
+ControlHandler = Callable[..., Awaitable[Any]]
 
 
 @dataclass
@@ -98,7 +106,7 @@ class ProgramStateMachine(StateMachine):
 
     def __init__(
         self,
-        server: Any,
+        server: Server,
         parent: Node,
         name: str = "Program",
         handlers: ProgramHandlers | None = None,
@@ -137,14 +145,17 @@ class ProgramStateMachine(StateMachine):
 
     @property
     def node(self) -> Node:
+        """The Program instance in the address space."""
         return self._state_machine_node
 
     @property
     def diagnostics_node(self) -> Node | None:
+        """The ProgramDiagnostic variable, None without diagnostics."""
         return self._diagnostic_node
 
     @property
     def state(self) -> str:
+        """The name of the current State: Ready, Running, Suspended or Halted."""
         return self._current_state.name or ""
 
     def _instances(self) -> dict[ua.NodeId, list[ProgramStateMachine]]:
@@ -154,7 +165,10 @@ class ProgramStateMachine(StateMachine):
         return registry
 
     async def install(self, optionals: bool = True) -> None:
-        """Create the Program below the parent in its initial state."""
+        """
+        Create the Program below the parent in its initial state. The Program always has its optional parts;
+        optionals is there for the signature of StateMachine.install.
+        """
         siblings = self._instances().setdefault(PROGRAM_TYPE, [])
         if self.max_instance_count != NO_LIMIT and len(siblings) >= self.max_instance_count:
             raise ua.uaerrors.BadResourceUnavailable()
@@ -298,7 +312,7 @@ class ProgramStateMachine(StateMachine):
         _, _, source, target = TRANSITIONS[name]
         if self.state != source:
             raise ua.uaerrors.BadInvalidState()
-        event: Any = self._evgen.event
+        event: Any = self._event_generator().event
         event.IntermediateResult = (
             intermediate_result
             if intermediate_result is None or isinstance(intermediate_result, ua.Variant)
@@ -383,11 +397,9 @@ class ProgramStateMachine(StateMachine):
             return
         await self._diagnostic_node.write_value(ua.Variant(self._diagnostic, ua.VariantType.ExtensionObject))
         for name, node in self._diagnostic_parts.items():
-            value = getattr(self._diagnostic, DIAGNOSTIC_COMPONENTS[name])
+            value = getattr(self._diagnostic, name)
             try:
-                await node.write_value(value) if not isinstance(value, list) else await node.write_value(
-                    ua.Variant(value, _list_type(name))
-                )
+                await node.write_value(ua.Variant(value, _list_type(name)) if isinstance(value, list) else value)
             except ua.UaStatusCodeError:
                 _logger.debug("Could not update %s of %s", name, self._name, exc_info=True)
 

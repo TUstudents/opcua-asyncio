@@ -533,6 +533,17 @@ Node helpers:
   does not connect the current state to the new one and always raises a TransitionEvent (default message
   "<from> to <to>"). `State`/`Transition` ids follow the DataType of the `Id` property. The classes
   `ExclusiveLimitStateMachine`, `FileTransferStateMachine`, `ProgramStateMachine` and `ShelvedStateMachine` are removed.
+  `StateMachine` and `FiniteStateMachine` require the server and the parent (they had defaults that only raised),
+  using a machine before `install()` or `init()` raises `UaError`, and `State.effectivedisplayname`, which nothing
+  read, is gone.
+- The event helpers stop at a cycle of HasSubtype references among EventTypes (a non-conforming server's model)
+  with `UaError` instead of looping forever: `select_clauses_from_evtype`, `get_filter_from_event_type`,
+  `get_event_obj_from_type_node`, and `get_event_properties_from_type_node` and its siblings, which return None.
+- `get_event_obj_from_type_node` returns an instance of the nearest standard EventType class with the fields of the
+  custom types, instead of an instance of a class made for each call. `Event.add_variable` is `add_property`.
+  Removed, as unused: `Event.to_event_fields_using_subscription_fields` and the `_freeze` attribute.
+- `condition_refresh` and `condition_refresh2` raise `UaError` for a Subscription that was never created on the
+  server instead of `TypeError`.
 - `get_node_supertypes` returns the nearest supertype first; `get_nodes_of_namespace` can return namespace 0 and raises
   `UaError` for an unknown URI; `get_node_children` and `get_node_subtypes` list each node once.
 

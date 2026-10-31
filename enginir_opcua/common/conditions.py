@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import TYPE_CHECKING
 
 from enginir_opcua import ua
 
-from .events import get_filter_from_event_type
+from .events import Event, get_filter_from_event_type
 from .node import Node
+from .session_interface import AbstractSession
+
+if TYPE_CHECKING:
+    from enginir_opcua import Client, Server
+    from enginir_opcua.common.subscription import Subscription
+
+type ConditionHost = Client | Server
 
 _logger = logging.getLogger(__name__)
 
@@ -50,19 +57,24 @@ def _event_id(event_id: bytes | ua.Variant) -> ua.Variant:
     return ua.Variant(bytes(event_id), ua.VariantType.ByteString)
 
 
-async def _call(client: Any, condition: Node | ua.NodeId, method: ua.NodeId, *arguments: ua.Variant) -> None:
+async def _call(
+    client: ConditionHost | AbstractSession, condition: Node | ua.NodeId, method: ua.NodeId, *arguments: ua.Variant
+) -> None:
     nodeid = _id(condition)
-    node = client.get_node(nodeid) if hasattr(client, "get_node") else Node(client, nodeid)
+    get_node = getattr(client, "get_node", None)
+    node: Node = get_node(nodeid) if get_node is not None else Node(client, nodeid)  # type: ignore[arg-type]
     await node.call_method(method, *arguments)
 
 
 async def condition_event_filter(
-    client: Any, types: Node | ua.NodeId | int | Iterable[Node | ua.NodeId | int] = CONDITION_TYPE
+    client: ConditionHost, types: Node | ua.NodeId | int | Iterable[Node | ua.NodeId | int] = CONDITION_TYPE
 ) -> ua.EventFilter:
-    """The EventFilter of a current-alarm display: the fields of the types, the ConditionId, OfType as where clause."""
+    """
+    The EventFilter of a current-alarm display: the fields of the types, the ConditionId and OfType as where
+    clause. TrueState and FalseState are left out; they are metadata of the type, not Event fields (Part 9, 5.2).
+    """
     raw = [types] if isinstance(types, Node | ua.NodeId | int) else list(types)
     flt = await get_filter_from_event_type([client.get_node(_id(item)) for item in raw])
-    # Part 9, 5.2: TrueState and FalseState are metadata of the type and cannot be selected
     flt.SelectClauses = [
         clause
         for clause in flt.SelectClauses
@@ -72,60 +84,79 @@ async def condition_event_filter(
 
 
 async def acknowledge(
-    client: Any,
+    client: ConditionHost | AbstractSession,
     condition: Node | ua.NodeId,
     event_id: bytes | ua.Variant,
     comment: str | ua.LocalizedText | None = None,
 ) -> None:
+    """Acknowledge the Condition state of the Event event_id (Part 9, 5.7.3)."""
     await _call(client, condition, ACKNOWLEDGE, _event_id(event_id), _comment(comment))
 
 
 async def confirm(
-    client: Any,
+    client: ConditionHost | AbstractSession,
     condition: Node | ua.NodeId,
     event_id: bytes | ua.Variant,
     comment: str | ua.LocalizedText | None = None,
 ) -> None:
+    """Confirm the Condition state of the Event event_id (Part 9, 5.7.4)."""
     await _call(client, condition, CONFIRM, _event_id(event_id), _comment(comment))
 
 
 async def add_comment(
-    client: Any, condition: Node | ua.NodeId, event_id: bytes | ua.Variant, comment: str | ua.LocalizedText
+    client: ConditionHost | AbstractSession,
+    condition: Node | ua.NodeId,
+    event_id: bytes | ua.Variant,
+    comment: str | ua.LocalizedText,
 ) -> None:
+    """Add a comment to the Condition state of the Event event_id (Part 9, 5.5.6)."""
     await _call(client, condition, ADD_COMMENT, _event_id(event_id), _comment(comment))
 
 
-async def enable(client: Any, condition: Node | ua.NodeId) -> None:
+async def enable(client: ConditionHost | AbstractSession, condition: Node | ua.NodeId) -> None:
+    """Enable the Condition (Part 9, 5.5.5)."""
     await _call(client, condition, ENABLE)
 
 
-async def disable(client: Any, condition: Node | ua.NodeId) -> None:
+async def disable(client: ConditionHost | AbstractSession, condition: Node | ua.NodeId) -> None:
+    """Disable the Condition (Part 9, 5.5.4)."""
     await _call(client, condition, DISABLE)
 
 
-async def timed_shelve(client: Any, condition: Node | ua.NodeId, milliseconds: float) -> None:
+async def timed_shelve(
+    client: ConditionHost | AbstractSession, condition: Node | ua.NodeId, milliseconds: float
+) -> None:
+    """Shelve the alarm for the given time (Part 9, 5.8.17.4); condition is the alarm or its ShelvingState."""
     await _call(client, condition, TIMED_SHELVE, ua.Variant(float(milliseconds), ua.VariantType.Double))
 
 
-async def one_shot_shelve(client: Any, condition: Node | ua.NodeId) -> None:
+async def one_shot_shelve(client: ConditionHost | AbstractSession, condition: Node | ua.NodeId) -> None:
+    """Shelve the alarm until it next goes inactive (Part 9, 5.8.17.6)."""
     await _call(client, condition, ONE_SHOT_SHELVE)
 
 
-async def unshelve(client: Any, condition: Node | ua.NodeId) -> None:
+async def unshelve(client: ConditionHost | AbstractSession, condition: Node | ua.NodeId) -> None:
+    """End the shelving of the alarm (Part 9, 5.8.17.2)."""
     await _call(client, condition, UNSHELVE)
 
 
-def _subscription_id(subscription: Any) -> int:
-    return int(subscription if isinstance(subscription, int) else subscription.subscription_id)
+def _subscription_id(subscription: Subscription | int) -> int:
+    if isinstance(subscription, int):
+        return subscription
+    if subscription.subscription_id is None:
+        raise ua.UaError("The subscription has not been created on the server")
+    return subscription.subscription_id
 
 
-async def condition_refresh(client: Any, subscription: Any) -> None:
+async def condition_refresh(client: ConditionHost | AbstractSession, subscription: Subscription | int) -> None:
     """ConditionRefresh for every Event item of a Subscription (Part 9, 5.5.7)."""
     argument = ua.Variant(_subscription_id(subscription), ua.VariantType.UInt32)
     await _call(client, CONDITION_TYPE, REFRESH, argument)
 
 
-async def condition_refresh2(client: Any, subscription: Any, monitored_item_id: int) -> None:
+async def condition_refresh2(
+    client: ConditionHost | AbstractSession, subscription: Subscription | int, monitored_item_id: int
+) -> None:
     """ConditionRefresh2 for one item; a server without it (Bad_MethodInvalid) gets ConditionRefresh (Part 9, 5.5.8)."""
     arguments = [
         ua.Variant(_subscription_id(subscription), ua.VariantType.UInt32),
@@ -145,12 +176,13 @@ class ConditionTracker:
     Pass it as the handler of a Subscription that selects the ConditionId (`condition_event_filter`).
     """
 
-    def __init__(self, on_change: Callable[[Any, bool], None] | None = None) -> None:
-        self.entries: dict[tuple[ua.NodeId, ua.NodeId], Any] = {}
+    def __init__(self, on_change: Callable[[Event, bool], None] | None = None) -> None:
+        self.entries: dict[tuple[ua.NodeId, ua.NodeId], Event] = {}
         self._suspect: set[tuple[ua.NodeId, ua.NodeId]] = set()
         self._on_change = on_change
 
-    def event_notification(self, event: Any) -> None:
+    def event_notification(self, event: Event) -> None:
+        """The subscription handler callback: update the entries and call on_change(event, retained)."""
         event_type = getattr(event, "EventType", None)
         if event_type == REFRESH_START:
             self._suspect = set(self.entries)
@@ -172,12 +204,13 @@ class ConditionTracker:
         else:
             self._remove(key, event)
 
-    def _remove(self, key: tuple[ua.NodeId, ua.NodeId], event: Any = None) -> None:
+    def _remove(self, key: tuple[ua.NodeId, ua.NodeId], event: Event | None = None) -> None:
         removed = self.entries.pop(key, None)
-        if removed is not None or event is not None:
-            self._notify(event if event is not None else removed, False)
+        notified = event if event is not None else removed
+        if notified is not None:
+            self._notify(notified, False)
 
-    def _notify(self, event: Any, retained: bool) -> None:
+    def _notify(self, event: Event, retained: bool) -> None:
         if self._on_change is not None:
             try:
                 self._on_change(event, retained)

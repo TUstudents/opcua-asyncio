@@ -92,6 +92,10 @@ disable_error_code = ["literal-required", "name-defined"]
 [[tool.mypy.overrides]]
 module = [
   "enginir_opcua.common.connection",
+  "enginir_opcua.common.conditions",
+  "enginir_opcua.common.events",
+  "enginir_opcua.common.programs",
+  "enginir_opcua.common.statemachine",
   "enginir_opcua.common.callback",
   "enginir_opcua.common.copy_node_util",
   "enginir_opcua.common.instantiate_util",

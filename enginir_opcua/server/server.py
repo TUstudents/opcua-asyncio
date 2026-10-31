@@ -925,7 +925,7 @@ class Server:
     async def get_event_generator(
         self,
         etype: BaseEvent | Node | ua.NodeId | int | None = None,
-        emitting_node: ua.NodeId | int = ua.ObjectIds.Server,
+        emitting_node: Node | ua.NodeId | int = ua.ObjectIds.Server,
     ) -> EventGenerator:
         """
         Returns an event object using an event type from address space.

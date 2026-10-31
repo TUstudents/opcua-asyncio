@@ -1,8 +1,7 @@
 """
-Helpers to expose a state machine of OPC 10000-16 (State Machines; Annex B of OPC 10000-5 in v1.04:
-StateMachineType, FiniteStateMachineType) in the
-address space of a local server, keep CurrentState and LastTransition current and raise TransitionEvents.
-Sub state machines and the specialised state machines of other parts are not implemented.
+State machines of OPC 10000-16 (StateMachineType, FiniteStateMachineType; Annex B of OPC 10000-5 in v1.04) in the
+address space of a local server: the helpers keep CurrentState and LastTransition current and raise
+TransitionEvents. Sub state machines and the specialised state machines of other parts are not implemented.
 """
 
 from __future__ import annotations
@@ -14,9 +13,11 @@ from typing import TYPE_CHECKING, Any
 from enginir_opcua import Node, ua
 from enginir_opcua.common.event_objects import TransitionEvent
 
+from .instantiate_util import is_abstract
 from .ua_utils import is_subtype
 
 if TYPE_CHECKING:
+    from enginir_opcua import Server
     from enginir_opcua.server.event_generator import EventGenerator
 
 _logger = logging.getLogger(__name__)
@@ -43,8 +44,7 @@ class State:
         self.id: ua.Variant | None = ua.Variant(id) if id is not None else None
         self.name = name
         self.number = number
-        self.effectivedisplayname = ua.LocalizedText(name, "en-US")
-        self.node: Node = node  # type: ignore[assignment]
+        self.node = node
         self.initial = False
 
 
@@ -64,18 +64,20 @@ class Transition:
         self.from_state: State | None = None
         self.to_state: State | None = None
         self._transitiontime = datetime.datetime.now(datetime.UTC)
-        self.node: Node = node  # type: ignore[assignment]
+        self.node = node
 
 
 class StateMachine:
     """
     A StateMachineType instance: CurrentState (mandatory) and LastTransition (optional), generating TransitionEvents.
+    server is the local Server that fires the events, parent the node the machine is created below, idx the
+    namespace of the new nodes (default: the parent's).
     """
 
     def __init__(
         self,
-        server: Any = None,
-        parent: Node | None = None,
+        server: Server,
+        parent: Node,
         idx: int | None = None,
         name: str | None = None,
     ) -> None:
@@ -90,12 +92,12 @@ class StateMachine:
         self.locale = "en-US"
         self._server = server
         self._parent = parent
-        self._state_machine_node: Node = None  # type: ignore[assignment]
+        self._machine: Node | None = None
         self._state_machine_type = _STATE_MACHINE_TYPE
         self._name = name
         self._idx = idx
         self._optionals = False
-        self._current_state_node: Node = None  # type: ignore[assignment]
+        self._current_state_node: Node | None = None
         self._current_state_id_node: Node | None = None
         self._current_state_name_node: Node | None = None
         self._current_state_number_node: Node | None = None
@@ -105,11 +107,26 @@ class StateMachine:
         self._last_transition_name_node: Node | None = None
         self._last_transition_number_node: Node | None = None
         self._last_transition_transitiontime_node: Node | None = None
-        self._evgen: EventGenerator = None  # type: ignore[assignment]
+        self._evgen: EventGenerator | None = None
         self.evtype = TransitionEvent()
         self._current_state = State(None)
         self._states: list[State] = []
         self._transitions: list[Transition] = []
+
+    @property
+    def _state_machine_node(self) -> Node:
+        if self._machine is None:
+            raise ua.UaError(f"Statemachine: {self._name} is not installed; call install() or init() first")
+        return self._machine
+
+    @_state_machine_node.setter
+    def _state_machine_node(self, node: Node) -> None:
+        self._machine = node
+
+    def _event_generator(self) -> EventGenerator:
+        if self._evgen is None:
+            raise ua.UaError(f"Statemachine: {self._name} is not installed; call install() or init() first")
+        return self._evgen
 
     async def _concrete_type(self) -> ua.NodeId:
         return self._state_machine_type
@@ -165,12 +182,17 @@ class StateMachine:
         if datatype == ua.NodeId(ua.ObjectIds.NodeId):
             if item.id is not None and item.id.VariantType != ua.VariantType.NodeId:
                 raise ValueError(f"Statemachine: {self._name} -> id of {item.name} must be a NodeId")
-            return item.id if item.id is not None else ua.Variant(item.node.nodeid, ua.VariantType.NodeId)
+            return item.id if item.id is not None else self._node_id_variant(item)
         if datatype == ua.NodeId(ua.ObjectIds.String):
             if item.id is not None and item.id.VariantType != ua.VariantType.String:
                 raise ValueError(f"Statemachine: {self._name} -> id of {item.name} must be a String")
             return item.id if item.id is not None else ua.Variant(item.name, ua.VariantType.String)
-        return item.id if item.id is not None else ua.Variant(item.node.nodeid, ua.VariantType.NodeId)
+        return item.id if item.id is not None else self._node_id_variant(item)
+
+    def _node_id_variant(self, item: State | Transition) -> ua.Variant:
+        if item.node is None:
+            raise ValueError(f"Statemachine: {self._name} -> {item.name} has no node")
+        return ua.Variant(item.node.nodeid, ua.VariantType.NodeId)
 
     def _check_change(self, state: State, transition: Transition | None) -> None:
         if not isinstance(state, State):
@@ -222,16 +244,19 @@ class StateMachine:
             event_msg = ua.LocalizedText(
                 f"{previous.name} to {state.name}" if previous.name else state.name, self.locale
             )
-        event: Any = self._evgen.event
+        evgen = self._event_generator()
+        event: Any = evgen.event
         event.Message = event_msg
         event.Severity = severity
         event.ToState = to_text
         event.FromState = from_text
         event.Transition = ua.LocalizedText(transition.name, self.locale) if transition else ua.LocalizedText()
-        await self._evgen.trigger()
+        await evgen.trigger()
         self._current_state = state
 
     async def _write_state(self, state: State) -> None:
+        if self._current_state_node is None:
+            raise ua.UaError(f"Statemachine: {self._name} is not installed; call install() or init() first")
         await self._current_state_node.write_value(
             ua.LocalizedText(state.name, self.locale), ua.VariantType.LocalizedText
         )
@@ -270,7 +295,7 @@ class StateMachine:
                 transition._transitiontime, ua.VariantType.DateTime
             )
 
-    def _check_unique(self, item: State | Transition, known: list[Any], kind: str) -> None:
+    def _check_unique(self, item: State | Transition, known: list[State] | list[Transition], kind: str) -> str:
         if not item.name:
             raise ValueError(f"Statemachine: {self._name} -> {kind}.name is None")
         if item.number is None:
@@ -282,6 +307,7 @@ class StateMachine:
                 raise ValueError(f"Statemachine: {self._name} -> {kind} name {item.name} is used twice")
             if other.number == item.number:
                 raise ValueError(f"Statemachine: {self._name} -> {kind} number {item.number} is used twice")
+        return item.name
 
     async def add_state(self, state: State, state_type: ua.NodeId = _STATE_TYPE, optionals: bool = False) -> Node:
         """
@@ -292,17 +318,18 @@ class StateMachine:
             raise ValueError(f"Statemachine: {self._name} -> state: {state} is not a instance of State class")
         if not await is_subtype(Node(self._parent.session, state_type), _STATE_TYPE):
             raise ValueError(f"Statemachine: {self._name} -> state_type: {state_type} is not a StateType")
-        self._check_unique(state, self._states, "State")
+        name = self._check_unique(state, self._states, "State")
         if state_type == _INITIAL_STATE_TYPE and any(s.initial for s in self._states):
             raise ValueError(f"Statemachine: {self._name} -> the machine already has an initial State")
-        state.node = await self._state_machine_node.add_object(
-            self._idx, state.name, objecttype=state_type, instantiate_optional=optionals
+        node = await self._state_machine_node.add_object(
+            self._idx, name, objecttype=state_type, instantiate_optional=optionals
         )
+        state.node = node
         state.initial = state_type == _INITIAL_STATE_TYPE
-        state_number = await state.node.get_child(["StateNumber"])
+        state_number = await node.get_child(["StateNumber"])
         await state_number.write_value(state.number, ua.VariantType.UInt32)
         self._states.append(state)
-        return state.node
+        return node
 
     async def add_transition(
         self,
@@ -323,21 +350,25 @@ class StateMachine:
                 raise ValueError(f"Statemachine: {self._name} -> state {end.name} was not added with add_state")
         if (from_state is None) != (to_state is None):
             raise ValueError(f"Statemachine: {self._name} -> a transition needs both from_state and to_state")
-        self._check_unique(transition, self._transitions, "Transition")
-        transition.node = await self._state_machine_node.add_object(
-            self._idx, transition.name, objecttype=transition_type, instantiate_optional=optionals
+        name = self._check_unique(transition, self._transitions, "Transition")
+        node = await self._state_machine_node.add_object(
+            self._idx, name, objecttype=transition_type, instantiate_optional=optionals
         )
-        transition_number = await transition.node.get_child(["TransitionNumber"])
+        transition.node = node
+        transition_number = await node.get_child(["TransitionNumber"])
         await transition_number.write_value(transition.number, ua.VariantType.UInt32)
-        if from_state is not None and to_state is not None:
-            await transition.node.add_reference(
-                from_state.node, ua.ObjectIds.FromState, True, True, ua.NodeClass.Object
-            )
-            await transition.node.add_reference(to_state.node, ua.ObjectIds.ToState, True, True, ua.NodeClass.Object)
+        if (
+            from_state is not None
+            and to_state is not None
+            and from_state.node is not None
+            and to_state.node is not None
+        ):
+            await node.add_reference(from_state.node, ua.ObjectIds.FromState, True, True, ua.NodeClass.Object)
+            await node.add_reference(to_state.node, ua.ObjectIds.ToState, True, True, ua.NodeClass.Object)
             transition.from_state = from_state
             transition.to_state = to_state
         self._transitions.append(transition)
-        return transition.node
+        return node
 
 
 class FiniteStateMachine(StateMachine):
@@ -349,8 +380,8 @@ class FiniteStateMachine(StateMachine):
 
     def __init__(
         self,
-        server: Any = None,
-        parent: Node | None = None,
+        server: Server,
+        parent: Node,
         idx: int | None = None,
         name: str | None = None,
         state_machine_type: ua.NodeId | None = None,
@@ -366,7 +397,7 @@ class FiniteStateMachine(StateMachine):
     async def _concrete_type(self) -> ua.NodeId:
         base = Node(self._parent.session, self._state_machine_type)
         if self._given_type:
-            if not await is_subtype(base, _FINITE_STATE_MACHINE_TYPE) or await _is_abstract(base):
+            if not await is_subtype(base, _FINITE_STATE_MACHINE_TYPE) or await is_abstract(base):
                 raise ValueError(
                     f"Statemachine: {self._name} -> {base.nodeid} is not a concrete FiniteStateMachineType"
                 )
@@ -388,18 +419,15 @@ class FiniteStateMachine(StateMachine):
             raise ValueError(f"{nodeids} is not a list of NodeIds")
 
     async def set_available_states(self, states: list[ua.NodeId]) -> None:
+        """Write AvailableStates, the States the machine can be in now; it needs install(optionals=True)."""
         self._check_node_ids(states)
         if self._available_states_node is None:
             self._available_states_node = await self._list_node("AvailableStates")
         await self._available_states_node.write_value(states, varianttype=ua.VariantType.NodeId)
 
     async def set_available_transitions(self, transitions: list[ua.NodeId]) -> None:
+        """Write AvailableTransitions, the Transitions possible now; it needs install(optionals=True)."""
         self._check_node_ids(transitions)
         if self._available_transitions_node is None:
             self._available_transitions_node = await self._list_node("AvailableTransitions")
         await self._available_transitions_node.write_value(transitions, varianttype=ua.VariantType.NodeId)
-
-
-async def _is_abstract(node: Node) -> bool:
-    value = (await node.read_attribute(ua.AttributeIds.IsAbstract)).Value
-    return bool(value is not None and value.Value)

@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 import pytest
@@ -6,9 +7,12 @@ from enginir_opcua import Server, ua
 from enginir_opcua.common.events import (
     Event,
     _event_type_nodes_up_to_base,
+    get_event_obj_from_type_node,
+    get_event_properties_from_type_node,
     select_clauses_from_evtype,
     where_clause_from_evtype,
 )
+from enginir_opcua.common.utils import wait_for
 
 
 @pytest.fixture(scope="module")
@@ -48,6 +52,26 @@ async def test_com29_unknown_parent_chain_raises(srv: Server) -> None:
         await _event_type_nodes_up_to_base(orphan)
     with pytest.raises(ua.UaError):
         await select_clauses_from_evtype([orphan])
+
+
+async def test_a_cycle_of_event_types_raises_instead_of_hanging(srv: Server, monkeypatch: pytest.MonkeyPatch) -> None:
+    from enginir_opcua.common.node import Node
+
+    first = await srv.nodes.base_event_type.add_object_type(ua.NodeId("cycle_a", 2), "2:cycle_a")
+    second = await first.add_object_type(ua.NodeId("cycle_b", 2), "2:cycle_b")
+    original = Node.get_referenced_nodes
+
+    async def looping(self: Node, *args: Any, **kwargs: Any) -> list[Node]:
+        if self.nodeid == first.nodeid and kwargs.get("direction") == ua.BrowseDirection.Inverse:
+            await asyncio.sleep(0)
+            return [second]
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Node, "get_referenced_nodes", looping)
+    for helper in (select_clauses_from_evtype([second]), get_event_obj_from_type_node(second)):
+        with pytest.raises(ua.UaError):
+            await wait_for(helper, 5)
+    assert await wait_for(get_event_properties_from_type_node(second), 5) is None
 
 
 async def test_com28_property_is_not_browsed_again(srv: Server, monkeypatch: pytest.MonkeyPatch) -> None:
