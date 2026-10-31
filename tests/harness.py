@@ -175,12 +175,19 @@ async def send_open_request(
     await peer.send(data)
 
 
-async def receive_service_status(peer: RawPeer, channel: SecureChannel) -> int:
-    """Reads one OPN reply (a ServiceFault or a response) and returns its ServiceResult."""
+async def receive_message(peer: RawPeer, channel: SecureChannel) -> ua.Message:
+    """Reads one single-chunk secure message from the peer and decodes it with the channel."""
     message_type, body = await peer.receive()
     data = CONNECTION_PROTOCOL_HEADER.pack(message_type, b"F", CONNECTION_PROTOCOL_HEADER.size + len(body)) + body
     ((header, chunk_body),) = _frames(data)
     message = channel.receive_from_header_and_body(header, chunk_body)
+    assert isinstance(message, ua.Message)
+    return message
+
+
+async def receive_service_status(peer: RawPeer, channel: SecureChannel) -> int:
+    """Reads one OPN reply (a ServiceFault or a response) and returns its ServiceResult."""
+    message = await receive_message(peer, channel)
     reply = message.body()
     nodeid_from_binary(reply)
     return struct_from_binary(ua.ResponseHeader, reply).ServiceResult.value
@@ -198,10 +205,7 @@ async def open_channel_as_client(peer: RawPeer, lifetime: int = 3_600_000) -> Se
     )
     request = ua.OpenSecureChannelRequest(Parameters=params)
     await peer.send(channel.message_to_binary(struct_to_binary(request), ua.MessageType.SecureOpen, request_id=1))
-    message_type, body = await peer.receive()
-    data = CONNECTION_PROTOCOL_HEADER.pack(message_type, b"F", CONNECTION_PROTOCOL_HEADER.size + len(body)) + body
-    ((header, chunk_body),) = _frames(data)
-    message = channel.receive_from_header_and_body(header, chunk_body)
+    message = await receive_message(peer, channel)
     response = struct_from_binary(ua.OpenSecureChannelResponse, message.body())
     channel.set_channel(response.Parameters, params.RequestType, params.ClientNonce)
     return channel
@@ -221,10 +225,7 @@ async def open_channel_as_server(
             )
         )
     )
-    message_type, body = await peer.receive()
-    data = CONNECTION_PROTOCOL_HEADER.pack(message_type, b"F", CONNECTION_PROTOCOL_HEADER.size + len(body)) + body
-    ((header, chunk_body),) = _frames(data)
-    message = channel.receive_from_header_and_body(header, chunk_body)
+    message = await receive_message(peer, channel)
     request = struct_from_binary(ua.OpenSecureChannelRequest, message.body())
     result = channel.open(request.Parameters, _ChannelIds())
     if tamper is not None:

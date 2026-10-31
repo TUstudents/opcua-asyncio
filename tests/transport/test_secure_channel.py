@@ -169,6 +169,19 @@ def test_cry7_old_and_new_tokens_both_work_during_a_renewal(policy: bool) -> Non
 
 
 @pytest.mark.parametrize("policy", [False, True], ids=["none", "basic256sha256"])
+def test_a_sequence_number_out_of_order_is_a_transport_error(policy: bool) -> None:
+    """Part 6, 6.7.2.4 and 6.7.7: the peer is told Bad_SecurityChecksFailed and the stored number stays."""
+    pair = open_pair(policy)
+    pair.send(pair.client, pair.server)
+    expected = pair.server._peer_sequence_number
+    pair.client._sequence_number += 5
+    with pytest.raises(TransportError) as error:
+        pair.send(pair.client, pair.server)
+    assert error.value.status == ua.StatusCodes.BadSecurityChecksFailed
+    assert pair.server._peer_sequence_number == expected
+
+
+@pytest.mark.parametrize("policy", [False, True], ids=["none", "basic256sha256"])
 def test_com62_a_token_is_accepted_until_125_percent_of_its_lifetime(policy: bool) -> None:
     """Part 4, 5.6.2.1: expired tokens are refused, also the current one, for every policy."""
     pair = open_pair(policy)

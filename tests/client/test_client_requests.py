@@ -11,14 +11,7 @@ from enginir_opcua.client.ua_client import UaClient, UaClientState, UASocketProt
 from enginir_opcua.common.connection import SecureChannel
 from enginir_opcua.common.methods import uamethod
 from enginir_opcua.ua.ua_binary import struct_to_binary
-from tests.harness import (
-    CONNECTION_PROTOCOL_HEADER,
-    RawPeer,
-    RawServer,
-    _frames,
-    connect_client,
-    open_channel_as_server,
-)
+from tests.harness import RawPeer, RawServer, connect_client, open_channel_as_server, receive_message
 
 
 async def handshaken(raw_server: RawServer, timeout: float = 0.3) -> tuple[UaClient, RawPeer, SecureChannel]:
@@ -31,10 +24,7 @@ async def handshaken(raw_server: RawServer, timeout: float = 0.3) -> tuple[UaCli
 
 
 async def receive_request_id(peer: RawPeer, channel: SecureChannel) -> int:
-    message_type, body = await peer.receive()
-    data = CONNECTION_PROTOCOL_HEADER.pack(message_type, b"F", CONNECTION_PROTOCOL_HEADER.size + len(body)) + body
-    ((header, chunk_body),) = _frames(data)
-    return channel.receive_from_header_and_body(header, chunk_body).request_id()
+    return (await receive_message(peer, channel)).request_id()
 
 
 async def send_read_response(peer: RawPeer, channel: SecureChannel, request_id: int) -> None:

@@ -147,7 +147,7 @@ async def test_request_limit_caps_in_flight_requests() -> None:
     async def send_request(
         request: Any,
         timeout: float | None = None,
-        message_type: ua.MessageType = ua.MessageType.SecureMessage,
+        message_type: bytes = ua.MessageType.SecureMessage,
     ) -> Buffer:
         nonlocal active, peak
         active += 1

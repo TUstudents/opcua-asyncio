@@ -6,7 +6,7 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Protocol
 
 from enginir_opcua import ua
 from enginir_opcua.ua.uaerrors import UaError, UaStatusCodeError
@@ -17,7 +17,7 @@ from ..ua.ua_binary import header_from_binary, header_to_binary, struct_from_bin
 from .utils import Buffer, NotEnoughData
 
 if TYPE_CHECKING:
-    from ..crypto.security_policies import CryptographyNone, SecurityPolicy
+    from ..crypto.security_policies import CryptographyNone, SecurityPolicy, SecurityPolicyFactory
 
 _logger = logging.getLogger("enginir_opcua.uaprotocol")
 
@@ -112,6 +112,7 @@ def reverse_hello_to_binary(server_uri: str, endpoint_url: str) -> bytes:
 
 
 def error_message_to_binary(status: int, reason: str = "") -> bytes:
+    """An Error message (OPC 10000-6 v1.05, 7.1.2.5); the Reason is cut to 4096 bytes."""
     reason = reason.encode()[:MAX_ERROR_REASON_BYTES].decode(errors="ignore")
     return uatcp_to_binary(ua.MessageType.Error, ua.ErrorMessage(ua.StatusCode(status), reason))
 
@@ -131,6 +132,7 @@ class FrameReader:
         self.buffer += data
 
     def frames(self) -> Iterator[tuple[ua.Header, Buffer]]:
+        """The whole messages in the buffer, each as its header and its body; a partial message stays buffered."""
         pos = 0
         try:
             while True:
@@ -189,6 +191,7 @@ class TransportLimits:
             self.max_chunk_count = DEFAULT_MAX_CHUNK_COUNT
 
     def is_msg_size_within_limit(self, sz: int) -> bool:
+        """Whether a received Message of sz bytes is within max_message_size; logs when it is not."""
         if self.max_message_size == 0:
             return True
         within_limit = sz <= self.max_message_size
@@ -197,6 +200,7 @@ class TransportLimits:
         return within_limit
 
     def is_chunk_count_within_limit(self, sz: int) -> bool:
+        """Whether a received Message of sz chunks is within max_chunk_count; logs when it is not."""
         if self.max_chunk_count == 0:
             return True
         within_limit = sz <= self.max_chunk_count
@@ -206,6 +210,7 @@ class TransportLimits:
 
     @staticmethod
     def check_hello(msg: ua.Hello) -> None:
+        """Refuse a Hello with a buffer below 8192 bytes or an EndpointUrl above 4096 bytes (7.1.2.3)."""
         for name in ("ReceiveBufferSize", "SendBufferSize"):
             size = getattr(msg, name)
             if size < MIN_BUFFER_SIZE:
@@ -216,6 +221,7 @@ class TransportLimits:
             raise TransportError(ua.StatusCodes.BadTcpEndpointUrlInvalid, "EndpointUrl is too long")
 
     def create_acknowledge_and_set_limits(self, msg: ua.Hello) -> ua.Acknowledge:
+        """Server side: check the Hello, revise the buffer sizes down to both sides' limits and answer them."""
         self.check_hello(msg)
         ack = ua.Acknowledge()
         ack.ReceiveBufferSize = min(msg.SendBufferSize, self.max_recv_buffer)
@@ -230,6 +236,7 @@ class TransportLimits:
         return ack
 
     def create_hello_limits(self, msg: ua.Hello) -> ua.Hello:
+        """Client side: write this side's limits into the Hello."""
         msg.ReceiveBufferSize = self.max_recv_buffer
         msg.SendBufferSize = self.max_send_buffer
         msg.MaxChunkCount = self.max_chunk_count
@@ -237,6 +244,7 @@ class TransportLimits:
         return msg
 
     def update_client_limits(self, msg: ua.Acknowledge) -> None:
+        """Client side: check the Acknowledge against the Hello that was sent and adopt its limits (7.1.2.4)."""
         if msg.ProtocolVersion > 0:
             raise TransportError(ua.StatusCodes.BadProtocolVersionUnsupported, "Acknowledge version is too high")
         for name, size, sent in (
@@ -263,8 +271,8 @@ class MessageChunk:
         self,
         crypto: CryptographyNone,
         body: bytes = b"",
-        msg_type: ua.MessageType = ua.MessageType.SecureMessage,
-        chunk_type: ua.ChunkType = ua.ChunkType.Single,
+        msg_type: bytes = ua.MessageType.SecureMessage,
+        chunk_type: bytes = ua.ChunkType.Single,
     ) -> None:
         self.MessageHeader = ua.Header(msg_type, chunk_type)
         self.SecurityHeader: ua.SymmetricAlgorithmHeader | ua.AsymmetricAlgorithmHeader
@@ -273,15 +281,15 @@ class MessageChunk:
         elif msg_type == ua.MessageType.SecureOpen:
             self.SecurityHeader = ua.AsymmetricAlgorithmHeader()
         else:
-            raise ua.UaError(f"Unsupported message type: {msg_type}")
+            raise ua.UaError(f"Unsupported message type: {msg_type!r}")
         self.SequenceHeader = ua.SequenceHeader()
         self.Body = body
         self.crypto = crypto
 
     @staticmethod
     def from_binary(security_policy: SecurityPolicy, data: Buffer) -> MessageChunk:
-        h = header_from_binary(data)
-        return MessageChunk.from_header_and_body(security_policy, h, data)
+        """Decode, verify and decrypt one whole chunk, header included."""
+        return MessageChunk.from_header_and_body(security_policy, header_from_binary(data), data)
 
     @staticmethod
     def from_header_and_body(
@@ -290,10 +298,15 @@ class MessageChunk:
         buf: Buffer,
         symmetric_cryptography: CryptographyNone | None = None,
     ) -> MessageChunk:
-        if not len(buf) >= header.body_size:
+        """
+        Verify and decrypt the body of one chunk whose header was already read. symmetric_cryptography selects the
+        keys of a token other than the current one; OPN chunks always use the asymmetric keys.
+        """
+        if len(buf) < header.body_size:
             raise ValueError("Full body expected here")
         data = buf.copy(header.body_size)
         buf.skip(header.body_size)
+        security_header: ua.SymmetricAlgorithmHeader | ua.AsymmetricAlgorithmHeader
         if header.MessageType in (ua.MessageType.SecureMessage, ua.MessageType.SecureClose):
             security_header = struct_from_binary(ua.SymmetricAlgorithmHeader, data)
             crypto = symmetric_cryptography or security_policy.symmetric_cryptography
@@ -313,19 +326,21 @@ class MessageChunk:
             crypto.verify(
                 header_to_binary(obj.MessageHeader) + struct_to_binary(obj.SecurityHeader) + decrypted, signature
             )
-        data = ua.utils.Buffer(crypto.remove_padding(decrypted))
+        data = Buffer(crypto.remove_padding(decrypted))
         obj.SequenceHeader = struct_from_binary(ua.SequenceHeader, data)
         obj.Body = data.read(len(data))
         return obj
 
     def encrypted_size(self, plain_size: int) -> int:
+        """Size on the wire of a padded plain part of plain_size bytes once signed and encrypted."""
         size = plain_size + self.crypto.signature_size()
         pbs = self.crypto.plain_block_size()
         if size % pbs != 0:
-            raise ua.UaError("Encryption error")
+            raise ua.UaError(f"Padded size {size} is not a multiple of the block size {pbs}")
         return size // pbs * self.crypto.encrypted_block_size()
 
     def to_binary(self) -> bytes:
+        """Pad, sign and encrypt the chunk; the SequenceNumber must be set."""
         security = struct_to_binary(self.SecurityHeader)
         encrypted_part = struct_to_binary(self.SequenceHeader) + self.Body
         encrypted_part += self.crypto.padding(len(encrypted_part))
@@ -336,6 +351,7 @@ class MessageChunk:
 
     @staticmethod
     def max_body_size(crypto: CryptographyNone, max_chunk_size: int) -> int:
+        """The most body bytes a symmetric chunk of max_chunk_size bytes can carry with these keys."""
         max_encrypted_size = max_chunk_size - ua.Header.max_size() - ua.SymmetricAlgorithmHeader.max_size()
         max_plain_size = (max_encrypted_size // crypto.encrypted_block_size()) * crypto.plain_block_size()
         return max_plain_size - ua.SequenceHeader.max_size() - crypto.signature_size() - crypto.min_padding_size()
@@ -345,30 +361,27 @@ class MessageChunk:
         security_policy: SecurityPolicy,
         body: bytes,
         max_chunk_size: int,
-        message_type: ua.MessageType = ua.MessageType.SecureMessage,
+        message_type: bytes = ua.MessageType.SecureMessage,
         channel_id: int = 1,
         request_id: int = 1,
         token_id: int = 1,
     ) -> list[MessageChunk]:
         """
-        Pack message body (as binary string) into one or more chunks.
-        Size of each chunk will not exceed max_chunk_size.
-        Returns a list of MessageChunks. SequenceNumber is not initialized here,
-        it must be set by Secure Channel driver.
+        Split a message body into chunks of at most max_chunk_size bytes. An OPN body is always one chunk
+        (OPC 10000-6 v1.05, 6.7.2). The SequenceNumber is left for the SecureChannel to set.
         """
         if message_type == ua.MessageType.SecureOpen:
-            # SecureOpen message must be in a single chunk (OPC 10000-6 v1.05, 6.7.2)
-            chunk = MessageChunk(security_policy.asymmetric_cryptography, body, message_type, ua.ChunkType.Single)
-            assert isinstance(chunk.SecurityHeader, ua.AsymmetricAlgorithmHeader)
-            chunk.SecurityHeader.SecurityPolicyURI = security_policy.URI
+            asymmetric_header = ua.AsymmetricAlgorithmHeader(SecurityPolicyURI=security_policy.URI)
             if security_policy.host_certificate and security_policy.Mode != ua.MessageSecurityMode.None_:
-                chunk.SecurityHeader.SenderCertificate = security_policy.host_certificate
-                for cert in security_policy.host_certificate_chain:
-                    chunk.SecurityHeader.SenderCertificate += cert
+                asymmetric_header.SenderCertificate = security_policy.host_certificate + b"".join(
+                    security_policy.host_certificate_chain
+                )
             if security_policy.peer_certificate:
-                chunk.SecurityHeader.ReceiverCertificateThumbPrint = certificate_thumbprint(
+                asymmetric_header.ReceiverCertificateThumbPrint = certificate_thumbprint(
                     security_policy.peer_certificate
                 )
+            chunk = MessageChunk(security_policy.asymmetric_cryptography, body, message_type, ua.ChunkType.Single)
+            chunk.SecurityHeader = asymmetric_header
             chunk.MessageHeader.ChannelId = channel_id
             chunk.SequenceHeader.RequestId = request_id
             return [chunk]
@@ -381,13 +394,9 @@ class MessageChunk:
         chunks = []
         for i in range(0, len(body), max_size):
             part = body[i : i + max_size]
-            if i + max_size >= len(body):
-                chunk_type = ua.ChunkType.Single
-            else:
-                chunk_type = ua.ChunkType.Intermediate
+            chunk_type = ua.ChunkType.Single if i + max_size >= len(body) else ua.ChunkType.Intermediate
             chunk = MessageChunk(crypto, part, message_type, chunk_type)
-            assert isinstance(chunk.SecurityHeader, ua.SymmetricAlgorithmHeader)
-            chunk.SecurityHeader.TokenId = token_id
+            chunk.SecurityHeader = ua.SymmetricAlgorithmHeader(TokenId=token_id)
             chunk.MessageHeader.ChannelId = channel_id
             chunk.SequenceHeader.RequestId = request_id
             chunks.append(chunk)
@@ -402,13 +411,22 @@ class MessageChunk:
     __repr__ = __str__
 
 
+class ChannelIdSource(Protocol):
+    """What the server-side SecureChannel needs from the server: unique SecureChannelIds."""
+
+    def get_new_channel_id(self) -> int: ...
+
+
 @dataclass
 class ChannelSettings:
+    """Bounds in milliseconds for the token lifetime a server grants; 0 requested means the default."""
+
     min_lifetime: int = 10_000
     max_lifetime: int = 3_600_000
     default_lifetime: int = 3_600_000
 
     def revise(self, requested: int) -> int:
+        """The RevisedLifetime for a RequestedLifetime (OPC 10000-4 v1.05, 5.6.2.2)."""
         if requested == 0:
             return self.default_lifetime
         return min(max(requested, self.min_lifetime), self.max_lifetime)
@@ -416,18 +434,25 @@ class ChannelSettings:
 
 @dataclass
 class TokenSlot:
+    """A SecurityToken with its keys and the monotonic time it was issued at."""
+
     token: ua.ChannelSecurityToken
     cryptography: CryptographyNone
     issued_at: float
 
     @property
     def window_end(self) -> float:
+        """The token is accepted until 125 % of its lifetime has passed (OPC 10000-4 v1.05, 5.6.2.1)."""
         return self.issued_at + self.token.RevisedLifetime * 5 / 4000
+
+
+type ReceivedMessage = ua.Message | AbortedMessage | ua.Acknowledge | ua.ErrorMessage | None
 
 
 class SecureChannel:
     """
-    Common logic for client and server
+    One end of an OPC UA Secure Conversation channel (OPC 10000-6 v1.05, 6.7), for client and server: the security
+    policy, the tokens with their keys, the sequence numbers and the reassembly of received chunks into Messages.
     """
 
     def __init__(self, security_policy: SecurityPolicy, limits: TransportLimits) -> None:
@@ -436,15 +461,15 @@ class SecureChannel:
         self._incoming_parts: list[MessageChunk] = []
         self._incoming_size = 0
         self.security_policy = security_policy
-        self._policies: list[Any] = []
+        self._policies: list[SecurityPolicyFactory] = []
         self.peer_certificate_check: Callable[[bytes], None] = _refuse_unchecked_certificate
         self._open = False
         self.security_token = ua.ChannelSecurityToken()
         self._current: TokenSlot | None = None
         self._next: TokenSlot | None = None
         self._previous: TokenSlot | None = None
-        self.local_nonce: int | bytes = 0
-        self.remote_nonce: int | bytes = 0
+        self.local_nonce = b""
+        self.remote_nonce = b""
         self._limits = limits
         self.last_used = time.monotonic()
         self._clock: Callable[[], float] = time.monotonic
@@ -500,6 +525,7 @@ class SecureChannel:
             self._current = None
 
     def expires_in(self) -> float:
+        """Seconds until the last token's window ends; 0 when no token is valid any more."""
         windows = [slot.window_end for slot in (self._current, self._next, self._previous) if slot is not None]
         if not windows:
             return 0.0
@@ -512,10 +538,10 @@ class SecureChannel:
                 return slot
         raise TransportError(ua.StatusCodes.BadSecureChannelTokenUnknown, f"Unknown token id {token_id}")
 
-    def set_channel(self, params: Any, request_type: ua.SecurityTokenRequestType, client_nonce: bytes) -> None:
-        """
-        Called on client side when getting secure channel data from server.
-        """
+    def set_channel(
+        self, params: ua.OpenSecureChannelResult, request_type: ua.SecurityTokenRequestType, client_nonce: bytes
+    ) -> None:
+        """Client side: take the token and keys of a checked OpenSecureChannel response; a Renew keeps the old token."""
         self.local_nonce = client_nonce
         self.remote_nonce = params.ServerNonce
         slot = self._slot(params.SecurityToken, client_nonce, params.ServerNonce)
@@ -524,9 +550,15 @@ class SecureChannel:
         self._make_current(slot)
         self._open = True
 
-    def open(self, params: Any, server: Any, settings: ChannelSettings | None = None) -> ua.OpenSecureChannelResult:
+    def open(
+        self,
+        params: ua.OpenSecureChannelParameters,
+        server: ChannelIdSource,
+        settings: ChannelSettings | None = None,
+    ) -> ua.OpenSecureChannelResult:
         """
-        Called on server side to open secure channel.
+        Server side: answer a validated OpenSecureChannel request. An Issue opens the channel with a new channel id;
+        a Renew keeps the id and holds the new token back until the client first uses it.
         """
         settings = settings or ChannelSettings()
         local_nonce = ua.utils.create_nonce(self.security_policy.secure_channel_nonce_length)
@@ -564,27 +596,27 @@ class SecureChannel:
     def is_open(self) -> bool:
         return self._open
 
-    def set_policy_factories(self, policies: list[Any]) -> None:
-        """
-        Set a list of available security policies.
-        Use this in servers with multiple endpoints with different security.
-        """
+    def set_policy_factories(self, policies: list[SecurityPolicyFactory]) -> None:
+        """Server side: the security policies of the server's endpoints, one of which an Issue request selects."""
         self._policies = policies
 
-    @staticmethod
-    def _policy_matches(policy: Any, uri: str, mode: ua.MessageSecurityMode | None = None) -> bool:
-        return policy.URI == uri and (mode is None or policy.Mode == mode)
+    def _uses_policy(self, uri: str, mode: ua.MessageSecurityMode | None = None) -> bool:
+        return self.security_policy.URI == uri and (mode is None or self.security_policy.Mode == mode)
 
     def select_policy(
         self, uri: str, peer_certificate: bytes | None, mode: ua.MessageSecurityMode | None = None
     ) -> None:
-        for policy in self._policies:
-            if policy.matches(uri, mode):
-                self.security_policy = policy.create(peer_certificate)
+        """
+        Server side: switch to the endpoint policy for this SecurityPolicyUri and, if given, mode. Raises
+        OpenRequestError with Bad_SecurityModeRejected when only the mode differs, else Bad_SecurityPolicyRejected.
+        """
+        for factory in self._policies:
+            if factory.matches(uri, mode):
+                self.security_policy = factory.create(peer_certificate)
                 return
-        if self.security_policy.URI == uri and (mode is None or self.security_policy.Mode == mode):
+        if self._uses_policy(uri, mode):
             return
-        if any(policy.matches(uri) for policy in self._policies) or self.security_policy.URI == uri:
+        if any(factory.matches(uri) for factory in self._policies) or self._uses_policy(uri):
             raise OpenRequestError(ua.StatusCodes.BadSecurityModeRejected, f"Mode {mode} is not configured for {uri}")
         raise OpenRequestError(ua.StatusCodes.BadSecurityPolicyRejected, f"No matching policy: {uri}")
 
@@ -595,6 +627,10 @@ class SecureChannel:
         params: ua.OpenSecureChannelParameters,
         protocol_version: int,
     ) -> None:
+        """
+        Server side: check a decrypted OpenSecureChannel request (OPC 10000-6 v1.05, 6.7.4 and 6.7.7). Raises
+        TransportError for what closes the connection and OpenRequestError for what a ServiceFault answers.
+        """
         renew = params.RequestType == ua.SecurityTokenRequestType.Renew
         if renew and self._open:
             self._check_renew_identity(message_channel_id, security_header, params)
@@ -641,6 +677,7 @@ class SecureChannel:
         protocol_version: int,
         sender_certificate: bytes | None = None,
     ) -> None:
+        """Client side: check the server's certificate chain, protocol version, token and nonce in the response."""
         if self.security_policy.URI != SecurityPolicyNone.URI:
             self.peer_certificate_check(self._server_chain(sender_certificate))
         token = response.SecurityToken
@@ -664,12 +701,11 @@ class SecureChannel:
         return leaf
 
     def message_to_binary(
-        self, message: bytes, message_type: ua.MessageType = ua.MessageType.SecureMessage, request_id: int = 0
+        self, message: bytes, message_type: bytes = ua.MessageType.SecureMessage, request_id: int = 0
     ) -> bytes:
         """
-        Convert OPC UA secure message to binary.
-        The only supported types are SecureOpen, SecureMessage, SecureClose.
-        If message_type is SecureMessage, the AlgorithmHeader should be passed as arg.
+        Encode a message body of type OPN, MSG or CLO as signed and encrypted chunks. A MSG above the peer's limits
+        raises MessageTooLarge before anything is encoded; a failure after the first chunk raises MessageAborted.
         """
         if message_type == ua.MessageType.SecureMessage:
             self._check_send_limits(message)
@@ -726,13 +762,6 @@ class SecureChannel:
         return abort.to_binary()
 
     def _check_incoming_chunk(self, chunk: MessageChunk) -> None:
-        if not isinstance(chunk, MessageChunk):
-            raise ValueError(f"Expected chunk, got: {chunk}")
-        if chunk.MessageHeader.MessageType != ua.MessageType.SecureOpen:
-            if chunk.MessageHeader.ChannelId != self.security_token.ChannelId:
-                raise ua.UaError(
-                    f"Wrong channel id {chunk.MessageHeader.ChannelId}, expected {self.security_token.ChannelId}"
-                )
         if self._incoming_parts:
             if self._incoming_parts[0].SequenceHeader.RequestId != chunk.SequenceHeader.RequestId:
                 raise self._reject_chunk(
@@ -740,28 +769,23 @@ class SecureChannel:
                     f"Wrong request id {chunk.SequenceHeader.RequestId},"
                     f" expected {self._incoming_parts[0].SequenceHeader.RequestId}",
                 )
-        # The sequence number must monotonically increase (but it can wrap around)
         seq_num = chunk.SequenceHeader.SequenceNumber
-        if self._peer_sequence_number is not None:
-            if seq_num != self._peer_sequence_number + 1:
-                wrap_limit = (1 << 32) - 1024
-                if seq_num < 1024 and self._peer_sequence_number >= wrap_limit:
-                    # The sequence number has wrapped around. See OPC 10000-6 v1.05, 6.7.2
-                    _logger.debug("Sequence number wrapped: %d -> %d", self._peer_sequence_number, seq_num)
-                else:
-                    # Condition for monotonically increase is not met
-                    raise ua.UaError(
-                        f"Received chunk: {chunk} with wrong sequence expecting:"
-                        f" {self._peer_sequence_number}, received: {seq_num},"
-                        f" spec says to close connection"
-                    )
+        previous = self._peer_sequence_number
+        if previous is not None and seq_num != previous + 1:
+            if seq_num < 1024 and previous >= (1 << 32) - 1024:
+                _logger.debug("Sequence number wrapped: %d -> %d", previous, seq_num)
+            else:
+                raise self._reject_chunk(
+                    ua.StatusCodes.BadSecurityChecksFailed,
+                    f"Bad_SequenceNumberInvalid: expected {previous + 1}, received {seq_num}",
+                )
         self._peer_sequence_number = seq_num
 
-    def receive_from_header_and_body(self, header: ua.Header, body: Buffer) -> Any:
+    def receive_from_header_and_body(self, header: ua.Header, body: Buffer) -> ReceivedMessage:
         """
-        Convert MessageHeader and binary body to OPC UA TCP message (see OPC UA
-        OPC 10000-6 v1.05, 7.1: Hello, Acknowledge or ErrorMessage), or a Message
-        object, or None (if intermediate chunk is received)
+        Process one whole received frame. OPN, MSG and CLO chunks are verified and decrypted and give a Message once
+        the final chunk is in, None for an intermediate chunk and an AbortedMessage for an Abort chunk. ACK and ERR
+        give the Acknowledge or ErrorMessage (OPC 10000-6 v1.05, 7.1.2). Anything else raises TransportError.
         """
         if header.MessageType == ua.MessageType.SecureOpen:
             data = body.copy(header.body_size)
@@ -789,20 +813,17 @@ class SecureChannel:
             if slot is not None and slot is self._next:
                 self._rotate()
             return msg
-        if header.MessageType == ua.MessageType.Hello:
-            msg = struct_from_binary(ua.Hello, body)
-            return msg
         if header.MessageType == ua.MessageType.Acknowledge:
-            msg = struct_from_binary(ua.Acknowledge, body)
-            self._limits.update_client_limits(msg)
-            return msg
+            ack = struct_from_binary(ua.Acknowledge, body)
+            self._limits.update_client_limits(ack)
+            return ack
         if header.MessageType == ua.MessageType.Error:
             error = struct_from_binary(ua.ErrorMessage, body)
             if len((error.Reason or "").encode()) > MAX_ERROR_REASON_BYTES:
                 error.Reason = ""
             _logger.warning("Received an error: %s", error)
             return error
-        raise ua.UaError(f"Unsupported message type {header.MessageType!r}")
+        raise TransportError(ua.StatusCodes.BadTcpMessageTypeInvalid, f"Unexpected message type {header.MessageType!r}")
 
     def _drop_incoming_parts(self) -> None:
         self._incoming_parts = []

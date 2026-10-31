@@ -91,6 +91,7 @@ disable_error_code = ["literal-required", "name-defined"]
 
 [[tool.mypy.overrides]]
 module = [
+  "enginir_opcua.common.connection",
   "enginir_opcua.common.xmlexporter",
   "enginir_opcua.common.xmlimporter",
   "enginir_opcua.common.xmlparser",

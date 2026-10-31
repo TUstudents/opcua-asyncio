@@ -174,7 +174,7 @@ class UaSession(AbstractSession):
         self,
         request: Any,
         timeout: float | None = None,
-        message_type: ua.MessageType = ua.MessageType.SecureMessage,
+        message_type: bytes = ua.MessageType.SecureMessage,
     ) -> Buffer:
         if not isinstance(request, ROUND_TRIP_REQUESTS):
             return await self._client._send_request(request, timeout, message_type)

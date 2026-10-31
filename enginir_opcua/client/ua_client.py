@@ -33,6 +33,7 @@ from ..common.connection import (
     MessageAborted,
     MessageSizeExceeded,
     MessageTooLarge,
+    ReceivedMessage,
     SecureChannel,
     TransportError,
     TransportLimits,
@@ -187,23 +188,25 @@ class UASocketProtocol(asyncio.Protocol):
 
     def _process_frame(self, header: ua.Header, body: Buffer) -> None:
         msg = self._channel.receive_from_header_and_body(header, body)
-        if header.MessageType == ua.MessageType.SecureOpen and isinstance(
-            self._open_secure_channel_exchange, ua.OpenSecureChannelParameters
+        if (
+            header.MessageType == ua.MessageType.SecureOpen
+            and isinstance(msg, ua.Message)
+            and isinstance(self._open_secure_channel_exchange, ua.OpenSecureChannelParameters)
         ):
             params = self._open_secure_channel_exchange
+            security_header = msg.security_header()
+            assert isinstance(security_header, ua.AsymmetricAlgorithmHeader)
             self.check_answer(msg.body(), " in response to OpenSecureChannelRequest")
             response: ua.OpenSecureChannelResponse = struct_from_binary(ua.OpenSecureChannelResponse, msg.body())
             response.ResponseHeader.ServiceResult.check()
             self._channel.check_open_response(
-                response.Parameters, params, self._acknowledged_version, msg.security_header().SenderCertificate
+                response.Parameters, params, self._acknowledged_version, security_header.SenderCertificate
             )
             self._open_secure_channel_exchange = response
             self._channel.set_channel(response.Parameters, params.RequestType, params.ClientNonce)
         self._process_received_message(msg)
 
-    def _process_received_message(
-        self, msg: ua.Message | AbortedMessage | ua.Acknowledge | ua.ErrorMessage | None
-    ) -> None:
+    def _process_received_message(self, msg: ReceivedMessage) -> None:
         if msg is None:
             pass
         elif isinstance(msg, ua.Message):
@@ -229,7 +232,7 @@ class UASocketProtocol(asyncio.Protocol):
         self,
         request: Any,
         timeout: float = 1,
-        message_type: ua.MessageType = ua.MessageType.SecureMessage,
+        message_type: bytes = ua.MessageType.SecureMessage,
         timeout_hint: float | None = None,
     ) -> asyncio.Future[Any]:
         """
@@ -273,7 +276,7 @@ class UASocketProtocol(asyncio.Protocol):
         self,
         request: Any,
         timeout: float | None = None,
-        message_type: ua.MessageType = ua.MessageType.SecureMessage,
+        message_type: bytes = ua.MessageType.SecureMessage,
         timeout_hint: float | None = None,
     ) -> Buffer:
         """
@@ -923,7 +926,7 @@ class UaClient:
         self,
         request: Any,
         timeout: float | None = None,
-        message_type: ua.MessageType = ua.MessageType.SecureMessage,
+        message_type: bytes = ua.MessageType.SecureMessage,
         *,
         timeout_hint: float | None = None,
         limited: bool = True,
@@ -935,7 +938,7 @@ class UaClient:
                 return await self._send_unlimited(request, timeout, message_type, timeout_hint)
 
     async def _send_unlimited(
-        self, request: Any, timeout: float | None, message_type: ua.MessageType, timeout_hint: float | None
+        self, request: Any, timeout: float | None, message_type: bytes, timeout_hint: float | None
     ) -> Buffer:
         if self.protocol is None:
             raise ConnectionError("Connection is not open")

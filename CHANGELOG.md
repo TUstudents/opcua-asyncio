@@ -296,6 +296,10 @@ SecureChannel (OPC 10000-6, 6.7; OPC 10000-4, 5.6.2):
 - Issue on an open channel and Renew on an unopened one fail with `Bad_RequestTypeInvalid`. Nonces, the receiver
   thumbprint, certificate, policy, mode and protocol version are checked on both sides.
 - The client renews after 75 % of each revised lifetime, at least every second.
+- A chunk with an out-of-order sequence number raises `TransportError` with `Bad_SecurityChecksFailed`, like a wrong
+  RequestId, so a client fails its pending requests with that status. A `HEL` from a server raises `TransportError`
+  with `Bad_TcpMessageTypeInvalid`. `SecureChannel.receive_from_header_and_body` is typed `ReceivedMessage` and no
+  longer decodes a Hello. `local_nonce` and `remote_nonce` start as `b""` instead of `0`.
 
 Server sessions (OPC 10000-4, 5.7):
 - `Session` and `SessionManager` (`iserver.session_manager`) replace the session state of `InternalSession`. A channel
